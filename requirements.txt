@@ -3,3 +3,4 @@ line-bot-sdk
 playwright
 python-dotenv
 openclaw
+openai
