@@ -1,22 +1,21 @@
-# 使用官方預裝好瀏覽器環境的映像檔
-FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+# 使用 Python 3.10 輕量版
+FROM python:3.10-slim
 
-# 設定程式在容器內的工作目錄
+# 設定工作目錄
 WORKDIR /app
 
-# 1. 複製依賴清單並安裝 Python 套件
+# 複製依賴清單
 COPY requirements.txt .
+
+# 1. 先安裝 Python 套件（這會包含 playwright 套件）
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 2. 下載 Chromium 瀏覽器本體
+# 2. 安裝 Chromium 瀏覽器及其所需的系統環境庫 (防止跑不起來)
 RUN playwright install chromium
+RUN playwright install-deps chromium
 
-# 3. 複製其餘所有程式碼（app.py 等）
+# 3. 複製剩餘程式碼
 COPY . .
-
-# 設定 Render 監聽的連接埠
-ENV PORT=10000
-EXPOSE 10000
 
 # 啟動應用程式
 CMD ["python", "app.py"]
