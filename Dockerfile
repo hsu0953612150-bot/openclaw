@@ -1,19 +1,24 @@
 FROM python:3.10-slim
 
+# 安裝基礎系統依賴
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# 複製依賴清單
+# 先安裝 Python 套件
 COPY requirements.txt .
-
-# 1. 先安裝 Python 套件
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 2. 安裝 Playwright 及其系統依賴 (確保視覺模組正常)
-RUN playwright install chromium
-RUN playwright install-deps chromium
+# --- 關鍵修復：使用 python -m 呼叫 playwright ---
+RUN python -m playwright install chromium
+RUN python -m playwright install-deps chromium
 
-# 3. 複製其餘程式碼
 COPY . .
 
-# 使用生產級伺服器啟動
+# Render 預設使用 PORT 1000
+EXPOSE 1000
+
 CMD ["python", "app.py"]
