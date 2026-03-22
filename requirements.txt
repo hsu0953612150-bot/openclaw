@@ -4,4 +4,5 @@ openai
 tavily-python
 gspread
 oauth2client
+playwright
 python-dotenv
