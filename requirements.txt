@@ -5,4 +5,3 @@ tavily-python
 gspread
 oauth2client
 python-dotenv
-playwright
