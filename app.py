@@ -3,6 +3,7 @@ import threading
 import json
 import base64
 import gspread
+from gspread.exceptions import CellNotFound
 import datetime
 from flask import Flask, request, abort
 
@@ -50,38 +51,53 @@ def get_gspread_client():
         print(f"🔥 GCP 認證解析失敗: {e}")
         raise
 
+def find_user_row(sheet, user_id):
+    # gspread.find() raises CellNotFound when the user has no row yet.
+    # Convert that expected first-message case into None so the caller can append.
+    try:
+        return sheet.find(user_id, in_column=1)
+    except CellNotFound:
+        return None
+
 def get_user_memory(user_id):
     try:
         client = get_gspread_client()
         sheet = client.open_by_key(CLEAN_ID).worksheet("UserMemory")
-        cell = sheet.find(user_id)
+        cell = find_user_row(sheet, user_id)
         if cell:
             val = sheet.cell(cell.row, 3).value
             return json.loads(val) if val else []
     except Exception as e:
-        print(f"⚠️ 讀取記憶跳過: {e}")
+        print(f"⚠️ 讀取記憶失敗: {type(e).__name__}: {e}")
     return []
 
 def save_user_memory(user_id, role, content):
     try:
         client = get_gspread_client()
         sheet = client.open_by_key(CLEAN_ID).worksheet("UserMemory")
-        
-        history = get_user_memory(user_id)
+        cell = find_user_row(sheet, user_id)
+
+        if cell:
+            val = sheet.cell(cell.row, 3).value
+            history = json.loads(val) if val else []
+        else:
+            history = []
+
         history.append({"role": role, "content": content})
         history = history[-8:]
-        
+
         json_str = json.dumps(history, ensure_ascii=False)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        cell = sheet.find(user_id)
+
         if cell:
             sheet.update_cell(cell.row, 3, json_str)
             sheet.update_cell(cell.row, 4, now)
         else:
             sheet.append_row([user_id, "chat_history", json_str, now])
+
+        print(f"✅ Google 試算表寫入成功（{role}）")
     except Exception as e:
-        print(f"❌ 試算表寫入失敗: {e}")
+        print(f"❌ Google 試算表寫入失敗: {type(e).__name__}: {e}")
 
 # --- 4. 大G 主任務 ---
 def gino_agent_task(user_id, user_msg=None, image_b64=None):
