@@ -29,7 +29,7 @@
   <main>
     <div class="brand">LINE 官方帳號・大G</div>
     <h1>即時語音對話</h1>
-    <p class="intro">按下開始後，直接對著手機說話。大G會即時聆聽、回答；你也可以打斷它繼續說。</p>
+    <p class="intro">按下「開始即時對話」並允許使用麥克風，就能直接和大G說話；你也可以打斷它繼續說。</p>
     <div id="orb" class="orb" aria-hidden="true">🎙️</div>
     <div id="status" role="status" aria-live="polite">準備開始</div>
     <button id="start" type="button">開始即時對話</button>
@@ -45,7 +45,6 @@
     const statusEl = document.querySelector('#status');
     const transcriptEl = document.querySelector('#transcript');
     const orb = document.querySelector('#orb');
-    const ticket = new URLSearchParams(location.hash.slice(1)).get('ticket');
     let socket;
     let audioContext;
     let mediaStream;
@@ -203,10 +202,6 @@
     }
 
     async function startSession() {
-      if (!ticket) {
-        setStatus('連結無效。請回到大G聊天室傳送「即時語音」取得新連結。', true);
-        return;
-      }
       startButton.disabled = true;
       setStatus('正在連線…');
       transcriptEl.textContent = '';
@@ -214,12 +209,11 @@
         const response = await fetch('/api/live-token', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ticket }),
+          body: JSON.stringify({}),
           cache: 'no-store',
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || '無法建立即時語音連線。');
-        history.replaceState(null, '', location.pathname);
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
         await audioContext.resume();
         outputGain = audioContext.createGain();
@@ -263,7 +257,6 @@
     startButton.addEventListener('click', startSession);
     stopButton.addEventListener('click', stopSession);
     window.addEventListener('pagehide', stopSession);
-    if (!ticket) setStatus('請從大G聊天室開啟即時語音連結。');
   </script>
 </body>
 </html>
