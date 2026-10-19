@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <title>大G即時語音</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #f3f6fb; color: #172033; display: grid; place-items: center; padding: 20px; }
+    main { width: min(100%, 480px); background: #fff; border-radius: 24px; padding: 28px 22px; box-shadow: 0 12px 40px #14213d18; text-align: center; }
+    .brand { color: #5072d8; font-size: 14px; font-weight: 700; letter-spacing: .08em; }
+    h1 { margin: 8px 0; font-size: 28px; }
+    .intro { color: #63708a; line-height: 1.6; margin: 8px auto 22px; max-width: 360px; }
+    .orb { width: 128px; height: 128px; border-radius: 50%; margin: 18px auto; display: grid; place-items: center; color: #fff; font-size: 48px; background: linear-gradient(145deg,#81a2ff,#526bd4); box-shadow: 0 12px 28px #526bd455; transition: transform .2s, box-shadow .2s; }
+    .orb.live { transform: scale(1.08); box-shadow: 0 0 0 14px #7189e522, 0 12px 28px #526bd455; animation: pulse 1.6s infinite; }
+    @keyframes pulse { 50% { box-shadow: 0 0 0 22px #7189e511, 0 12px 28px #526bd455; } }
+    #status { min-height: 28px; color: #52617a; font-size: 15px; }
+    #start { width: 100%; border: 0; border-radius: 14px; padding: 15px; margin-top: 12px; color: #fff; background: #506dd5; font-size: 17px; font-weight: 700; cursor: pointer; }
+    #start:disabled { opacity: .55; cursor: wait; }
+    #stop { display: none; width: 100%; border: 1px solid #d4dbea; border-radius: 14px; padding: 13px; margin-top: 10px; color: #34415a; background: #fff; font-size: 16px; cursor: pointer; }
+    #transcript { min-height: 28px; margin-top: 18px; color: #39465f; line-height: 1.55; overflow-wrap: anywhere; }
+    .privacy { margin: 18px 0 0; font-size: 12px; line-height: 1.5; color: #8993a7; }
+    .error { color: #b42318 !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand">LINE 官方帳號・大G</div>
+    <h1>即時語音對話</h1>
+    <p class="intro">按下開始後，直接對著手機說話。大G會即時聆聽、回答；你也可以打斷它繼續說。</p>
+    <div id="orb" class="orb" aria-hidden="true">🎙️</div>
+    <div id="status" role="status" aria-live="polite">準備開始</div>
+    <button id="start" type="button">開始即時對話</button>
+    <button id="stop" type="button">結束對話</button>
+    <div id="transcript" aria-live="polite"></div>
+    <p class="privacy">開始後，麥克風音訊會即時傳送至 Google Gemini 產生回覆；這段即時語音不會存入大G的對話試算表。結束對話可立即停止麥克風。</p>
+  </main>
+  <script>
+    const LIVE_MODEL_FALLBACK = 'models/gemini-3.8-live';
+    const SYSTEM_INSTRUCTION = '你是 LINE 官方帳號「大G」的 AI 助理，使用繁體中文自然地進行即時語音對話。回答親切、清楚、簡潔。只回答使用者實際提出的問題，不要聲稱已完成外部操作或已保存資料。請以口語方式回答，不要讀出 Markdown 符號。';
+    const startButton = document.querySelector('#start');
+    const stopButton = document.querySelector('#stop');
+    const statusEl = document.querySelector('#status');
+    const transcriptEl = document.querySelector('#transcript');
+    const orb = document.querySelector('#orb');
+    const ticket = new URLSearchParams(location.hash.slice(1)).get('ticket');
+    let socket;
+    let audioContext;
+    let mediaStream;
+    let processor;
+    let microphoneSource;
+    let outputGain;
+    let nextPlayTime = 0;
+    let live = false;
+
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle('error', isError);
+    }
+
+    function decodeBase64(base64) {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }
+
+    function downsampleTo16k(input, inputRate) {
+      if (inputRate === 16000) return input;
+      const ratio = inputRate / 16000;
+      const outputLength = Math.floor(input.length / ratio);
+      const output = new Float32Array(outputLength);
+      for (let i = 0; i < outputLength; i += 1) {
+        const start = Math.floor(i * ratio);
+        const end = Math.min(Math.floor((i + 1) * ratio), input.length);
+        let sum = 0;
+        for (let j = start; j < end; j += 1) sum += input[j];
+        output[i] = sum / Math.max(1, end - start);
+      }
+      return output;
+    }
+
+    function toPcm16Base64(floatSamples) {
+      const pcm = new Int16Array(floatSamples.length);
+      for (let i = 0; i < floatSamples.length; i += 1) {
+        const sample = Math.max(-1, Math.min(1, floatSamples[i]));
+        pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+      }
+      const bytes = new Uint8Array(pcm.buffer);
+      let binary = '';
+      const block = 0x8000;
+      for (let i = 0; i < bytes.length; i += block) {
+        binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + block, bytes.length)));
+      }
+      return btoa(binary);
+    }
+
+    function playPcm(base64, mimeType) {
+      if (!audioContext || !outputGain) return;
+      const match = /rate=(\d+)/i.exec(mimeType || '');
+      const sampleRate = match ? Number(match[1]) : 24000;
+      const bytes = decodeBase64(base64);
+      const samples = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+      if (!samples.length) return;
+      const audioBuffer = audioContext.createBuffer(1, samples.length, sampleRate);
+      const channel = audioBuffer.getChannelData(0);
+      for (let i = 0; i < samples.length; i += 1) channel[i] = samples[i] / 32768;
+      const source = audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(outputGain);
+      const startAt = Math.max(audioContext.currentTime + 0.02, nextPlayTime);
+      source.start(startAt);
+      nextPlayTime = startAt + audioBuffer.duration;
+      setStatus('大G正在回答…');
+    }
+
+    function handleServerMessage(message) {
+      if (message.setupComplete) {
+        setStatus('已連線，請直接說話');
+        orb.classList.add('live');
+        startMicrophone();
+      }
+      const content = message.serverContent;
+      if (!content) return;
+      if (content.interrupted) {
+        nextPlayTime = audioContext?.currentTime || 0;
+        setStatus('你可以繼續說話');
+      }
+      if (content.inputTranscription?.text) {
+        transcriptEl.textContent = `你：${content.inputTranscription.text}`;
+        setStatus('大G正在聆聽…');
+      }
+      if (content.outputTranscription?.text) {
+        transcriptEl.textContent = `大G：${content.outputTranscription.text}`;
+      }
+      for (const part of content.modelTurn?.parts || []) {
+        if (part.inlineData?.data && part.inlineData.mimeType?.startsWith('audio/pcm')) {
+          playPcm(part.inlineData.data, part.inlineData.mimeType);
+        }
+        if (part.text) transcriptEl.textContent = `大G：${part.text}`;
+      }
+      if (content.turnComplete) setStatus('已連線，請直接說話');
+    }
+
+    function startMicrophone() {
+      if (!live || !audioContext || socket?.readyState !== WebSocket.OPEN) return;
+      navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      }).then((stream) => {
+        if (!live) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        mediaStream = stream;
+        microphoneSource = audioContext.createMediaStreamSource(stream);
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
+        const silentGain = audioContext.createGain();
+        silentGain.gain.value = 0;
+        microphoneSource.connect(processor);
+        processor.connect(silentGain);
+        silentGain.connect(audioContext.destination);
+        processor.onaudioprocess = (event) => {
+          if (!live || socket?.readyState !== WebSocket.OPEN) return;
+          const samples = downsampleTo16k(event.inputBuffer.getChannelData(0), audioContext.sampleRate);
+          if (!samples.length) return;
+          socket.send(JSON.stringify({
+            realtimeInput: { audio: { data: toPcm16Base64(samples), mimeType: 'audio/pcm;rate=16000' } },
+          }));
+        };
+        setStatus('已連線，請直接說話');
+      }).catch((error) => {
+        setStatus(error.name === 'NotAllowedError' ? '需要允許麥克風權限才能開始。' : '無法啟用麥克風，請檢查裝置設定。', true);
+        stopSession();
+      });
+    }
+
+    function stopSession() {
+      live = false;
+      orb.classList.remove('live');
+      if (processor) {
+        processor.onaudioprocess = null;
+        processor.disconnect();
+        processor = null;
+      }
+      microphoneSource?.disconnect();
+      microphoneSource = null;
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((track) => track.stop());
+        mediaStream = null;
+      }
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+      socket = null;
+      outputGain?.disconnect();
+      outputGain = null;
+      if (audioContext) audioContext.close().catch(() => {});
+      audioContext = null;
+      startButton.style.display = 'block';
+      startButton.disabled = false;
+      stopButton.style.display = 'none';
+      if (!statusEl.classList.contains('error')) setStatus('已結束對話');
+    }
+
+    async function startSession() {
+      if (!ticket) {
+        setStatus('連結無效。請回到大G聊天室傳送「即時語音」取得新連結。', true);
+        return;
+      }
+      startButton.disabled = true;
+      setStatus('正在連線…');
+      transcriptEl.textContent = '';
+      try {
+        const response = await fetch('/api/live-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ticket }),
+          cache: 'no-store',
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || '無法建立即時語音連線。');
+        history.replaceState(null, '', location.pathname);
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        await audioContext.resume();
+        outputGain = audioContext.createGain();
+        outputGain.connect(audioContext.destination);
+        live = true;
+        socket = new WebSocket(
+          `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(result.token)}`,
+        );
+        socket.onopen = () => {
+          socket.send(JSON.stringify({ setup: {
+            model: result.model || LIVE_MODEL_FALLBACK,
+            generationConfig: {
+              responseModalities: ['AUDIO'],
+              speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
+            },
+            systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+            realtimeInputConfig: { automaticActivityDetection: { disabled: false } },
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+          } }));
+        };
+        socket.onmessage = (event) => {
+          try { handleServerMessage(JSON.parse(event.data)); }
+          catch (error) { console.error('Could not process Gemini Live message', error); }
+        };
+        socket.onerror = () => setStatus('即時語音連線發生問題，請回聊天室重新取得連結。', true);
+        socket.onclose = (event) => {
+          if (live) {
+            setStatus(event.code === 1000 ? '連線已結束。' : '連線中斷，請回聊天室重新取得連結。', event.code !== 1000);
+            stopSession();
+          }
+        };
+        startButton.style.display = 'none';
+        stopButton.style.display = 'block';
+      } catch (error) {
+        setStatus(error.message || '無法開始即時對話，請稍後再試。', true);
+        startButton.disabled = false;
+      }
+    }
+
+    startButton.addEventListener('click', startSession);
+    stopButton.addEventListener('click', stopSession);
+    window.addEventListener('pagehide', stopSession);
+    if (!ticket) setStatus('請從大G聊天室開啟即時語音連結。');
+  </script>
+</body>
+</html>
+
