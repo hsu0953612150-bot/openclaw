@@ -1,178 +1,252 @@
+import base64
+import datetime
+import json
 import os
 import threading
-import json
-import base64
-import gspread
-import datetime
-from flask import Flask, request, abort
+import urllib.error
+import urllib.request
 
-# LINE SDK v3
+import gspread
+from flask import Flask, abort, request
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi, MessagingApiBlob,
-    ReplyMessageRequest, PushMessageRequest, TextMessage
+    ApiClient,
+    Configuration,
+    MessagingApi,
+    MessagingApiBlob,
+    PushMessageRequest,
+    ReplyMessageRequest,
+    TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
+from linebot.v3.webhooks import ImageMessageContent, MessageEvent, TextMessageContent
 from oauth2client.service_account import ServiceAccountCredentials
 
-from openai import OpenAI
-from tavily import TavilyClient
 
 app = Flask(__name__)
+configuration = Configuration(access_token=os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
+handler = WebhookHandler(os.getenv("LINE_CHANNEL_SECRET"))
 
-# --- 1. 診斷路由 ---
-@app.route("/", methods=['GET'])
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+SPREADSHEET_RAW_ID = os.getenv("SPREADSHEET_ID", "")
+SPREADSHEET_ID = (
+    SPREADSHEET_RAW_ID.split("/d/")[1].split("/")[0]
+    if "/d/" in SPREADSHEET_RAW_ID
+    else SPREADSHEET_RAW_ID
+)
+SHEET_NAME = os.getenv("GOOGLE_SHEET_TAB", "UserMemory")
+MAX_HISTORY_MESSAGES = max(2, int(os.getenv("MAX_HISTORY_MESSAGES", "8")))
+
+SYSTEM_INSTRUCTION = """你是 LINE 官方帳號「大G」的 AI 助理，使用繁體中文回答。
+只回答使用者實際提出的問題。若使用者只說「測試訊息」、問候或沒有提出具體問題，簡短確認收到即可，不要猜測主題或補充無關建議。
+回答清楚、親切、精簡；不要聲稱已保存資料或完成外部操作，除非系統已明確完成。"""
+
+_sheet_lock = threading.Lock()
+
+
+@app.get("/")
 def health_check():
-    return "✅ 大G 服務目前在線！Playwright 已就緒。", 200
+    return "大G LINE/Gemini bridge is online.", 200
 
-# --- 2. 初始化 ---
-configuration = Configuration(access_token=os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
-handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
-ai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-tavily = TavilyClient(api_key=os.getenv('TAVILY_API_KEY'))
 
-RAW_ID = os.getenv('SPREADSHEET_ID', '')
-CLEAN_ID = RAW_ID.split('/d/')[1].split('/')[0] if '/d/' in RAW_ID else RAW_ID
+@app.get("/health")
+def health():
+    configured = bool(
+        GEMINI_API_KEY
+        and os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+        and os.getenv("LINE_CHANNEL_SECRET")
+        and os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+        and SPREADSHEET_ID
+    )
+    return {"ok": configured, "service": "daga-line-gemini", "model": GEMINI_MODEL}, (200 if configured else 503)
 
-# --- 3. Google Sheets 穩定連線 ---
-def get_gspread_client():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    gcp_json_raw = os.getenv('GCP_SERVICE_ACCOUNT_JSON', '{}')
-    # 強制修正 Render 環境變數轉義
-    gcp_json = gcp_json_raw.replace('\\\\n', '\n').replace('\\n', '\n').strip()
-    
-    try:
-        gcp_info = json.loads(gcp_json)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(gcp_info, scope)
-        return gspread.authorize(creds)
-    except Exception as e:
-        print(f"🔥 GCP 認證解析失敗: {e}")
-        raise
 
-def find_user_row(sheet, user_id):
-    # Search only the user-ID column; gspread.find() returns None when not found.
-    return sheet.find(user_id, in_column=1)
-
-def get_user_memory(user_id):
-    try:
-        client = get_gspread_client()
-        sheet = client.open_by_key(CLEAN_ID).worksheet("UserMemory")
-        cell = find_user_row(sheet, user_id)
-        if cell:
-            val = sheet.cell(cell.row, 3).value
-            return json.loads(val) if val else []
-    except Exception as e:
-        print(f"⚠️ 讀取記憶失敗: {type(e).__name__}: {e}")
-    return []
-
-def save_user_memory(user_id, role, content):
-    try:
-        client = get_gspread_client()
-        sheet = client.open_by_key(CLEAN_ID).worksheet("UserMemory")
-        cell = find_user_row(sheet, user_id)
-
-        if cell:
-            val = sheet.cell(cell.row, 3).value
-            history = json.loads(val) if val else []
-        else:
-            history = []
-
-        history.append({"role": role, "content": content})
-        history = history[-8:]
-
-        json_str = json.dumps(history, ensure_ascii=False)
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        if cell:
-            sheet.update_cell(cell.row, 3, json_str)
-            sheet.update_cell(cell.row, 4, now)
-        else:
-            sheet.append_row([user_id, "chat_history", json_str, now])
-
-        print(f"✅ Google 試算表寫入成功（{role}）")
-    except Exception as e:
-        print(f"❌ Google 試算表寫入失敗: {type(e).__name__}: {e}")
-
-# --- 4. 大G 主任務 ---
-def gino_agent_task(user_id, user_msg=None, image_b64=None):
-    with ApiClient(configuration) as api_client_line:
-        line_bot_api = MessagingApi(api_client_line)
-        try:
-            history = get_user_memory(user_id)
-            
-            if image_b64:
-                line_bot_api.push_message(PushMessageRequest(
-                    to=user_id, messages=[TextMessage(text="📸 [大G視覺] 正在透過 Chromium 進行內容分析...")]
-                ))
-                user_input = [
-                    {"type": "text", "text": "請根據這張圖片內容回答問題。"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
-                ]
-                search_query = "圖片物體辨識"
-            else:
-                line_bot_api.push_message(PushMessageRequest(
-                    to=user_id, messages=[TextMessage(text="🌐 [大G聯網] 正在檢索雲端記憶與最新資料...")]
-                ))
-                user_input = [{"type": "text", "text": user_msg}]
-                search_query = user_msg[:50]
-
-            search_res = tavily.search(query=search_query, search_depth="basic")
-            context = "\n".join([r['content'] for r in search_res['results'][:2]])
-
-            sys_prompt = {
-                "role": "system", 
-                "content": f"你是「大G」。目前地點與偏好請『嚴格遵守』雲端記憶。搜尋資料僅供參考：\n{context}"
-            }
-            
-            messages = [sys_prompt] + history + [{"role": "user", "content": user_input}]
-            response = ai_client.chat.completions.create(model="gpt-4o", messages=messages)
-            answer = response.choices[0].message.content
-            
-            save_user_memory(user_id, "user", user_msg if user_msg else "[圖片]")
-            save_user_memory(user_id, "assistant", answer)
-            
-            line_bot_api.push_message(PushMessageRequest(
-                to=user_id, messages=[TextMessage(text=f"✅ 大G回報：\n{answer}")]
-            ))
-        except Exception as e:
-            line_bot_api.push_message(PushMessageRequest(
-                to=user_id, messages=[TextMessage(text=f"❌ 錯誤: {str(e)[:100]}")]
-            ))
-
-# --- 5. Webhook ---
-@app.route("/callback", methods=['POST'])
+@app.post("/callback")
 def callback():
-    signature = request.headers.get('X-Line-Signature', '')
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        app.logger.warning("Rejected LINE webhook with invalid signature")
         abort(400)
-    return 'OK'
+    return "OK", 200
+
+
+def get_gspread_client():
+    raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
+    if not raw:
+        raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON is not configured")
+    normalized = raw.replace("\\\\n", "\n").replace("\\n", "\n").strip()
+    info = json.loads(normalized)
+    scopes = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
+    return gspread.authorize(credentials)
+
+
+def get_sheet():
+    if not SPREADSHEET_ID:
+        raise RuntimeError("SPREADSHEET_ID is not configured")
+    return get_gspread_client().open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+
+
+def load_history(user_id):
+    with _sheet_lock:
+        sheet = get_sheet()
+        cell = sheet.find(user_id, in_column=1)
+        if not cell:
+            app.logger.info("Sheets history lookup: no existing row for LINE user")
+            return []
+        value = sheet.cell(cell.row, 3).value
+        history = json.loads(value) if value else []
+        if not isinstance(history, list):
+            raise ValueError("Google Sheets conversation history is not a list")
+        app.logger.info("Sheets history lookup succeeded")
+        return history
+
+
+def save_history(user_id, history):
+    now = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    payload = json.dumps(history[-MAX_HISTORY_MESSAGES:], ensure_ascii=False)
+    with _sheet_lock:
+        sheet = get_sheet()
+        cell = sheet.find(user_id, in_column=1)
+        if cell:
+            sheet.update_cell(cell.row, 2, "chat_history")
+            sheet.update_cell(cell.row, 3, payload)
+            sheet.update_cell(cell.row, 4, now)
+        else:
+            sheet.append_row([user_id, "chat_history", payload, now], value_input_option="RAW")
+    app.logger.info("Google Sheets write succeeded (conversation history updated)")
+
+
+def gemini_generate(history, image_b64=None):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured on the service")
+    contents = []
+    for message in history[-MAX_HISTORY_MESSAGES:]:
+        role = "model" if message.get("role") == "assistant" else "user"
+        content = message.get("content", "")
+        contents.append({"role": role, "parts": [{"text": str(content)}]})
+    if image_b64:
+        contents.append({
+            "role": "user",
+            "parts": [
+                {"text": "請根據使用者傳來的圖片內容回答。"},
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
+            ],
+        })
+
+    body = json.dumps({
+        "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 800},
+    }).encode("utf-8")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:1000]
+        raise RuntimeError(f"Gemini API returned HTTP {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Gemini API connection failed: {error.reason}") from error
+
+    answer = "".join(
+        part.get("text", "")
+        for part in result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    ).strip()
+    if not answer:
+        raise RuntimeError("Gemini returned an empty response")
+    app.logger.info("Gemini request succeeded (model=%s)", GEMINI_MODEL)
+    return answer[:4900]
+
+
+def send_text(user_id, text):
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).push_message(
+            PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
+        )
+
+
+def process_message(user_id, user_text=None, image_b64=None):
+    try:
+        try:
+            history = load_history(user_id)
+        except Exception:
+            app.logger.exception("Google Sheets history read failed; continuing without prior context")
+            history = []
+        if user_text:
+            history.append({"role": "user", "content": user_text})
+        elif image_b64:
+            history.append({"role": "user", "content": "[圖片]"})
+        answer = gemini_generate(history, image_b64=image_b64)
+        history.append({"role": "assistant", "content": answer})
+        try:
+            save_history(user_id, history)
+        except Exception:
+            app.logger.exception("Google Sheets write failed; AI reply will still be sent")
+        send_text(user_id, answer)
+        app.logger.info("LINE final reply sent successfully")
+    except Exception as error:
+        app.logger.exception("LINE/Gemini message processing failed")
+        try:
+            send_text(user_id, "我目前暫時無法完成這則訊息，請稍後再試。系統已記錄錯誤供檢查。")
+        except Exception:
+            app.logger.exception("Could not send LINE error reply")
+
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
-    with ApiClient(configuration) as api_client_line:
-        line_bot_api = MessagingApi(api_client_line)
-        line_bot_api.reply_message(ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[TextMessage(text="🤖 收到，正在喚醒雲端記憶...")]
-        ))
-    threading.Thread(target=gino_agent_task, args=(event.source.user_id, event.message.text)).start()
+    app.logger.info("Received LINE text event")
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="🤖 收到，我正在整理回覆。")],
+            )
+        )
+    threading.Thread(
+        target=process_message,
+        args=(event.source.user_id, event.message.text, None),
+        daemon=True,
+    ).start()
+
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
-    with ApiClient(configuration) as api_client_line:
-        line_bot_api = MessagingApi(api_client_line)
-        line_bot_api_blob = MessagingApiBlob(api_client_line)
-        line_bot_api.reply_message(ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[TextMessage(text="🤖 收到圖片，分析中...")]
-        ))
-        msg_content = line_bot_api_blob.get_message_content(event.message.id)
-        img_b64 = base64.b64encode(msg_content).decode('utf-8')
-    threading.Thread(target=gino_agent_task, args=(event.source.user_id, None, img_b64)).start()
+    app.logger.info("Received LINE image event")
+    with ApiClient(configuration) as api_client:
+        line_api = MessagingApi(api_client)
+        line_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="🤖 收到圖片，我正在查看。")],
+            )
+        )
+        content = MessagingApiBlob(api_client).get_message_content(event.message.id)
+    image_b64 = base64.b64encode(content).decode("ascii")
+    threading.Thread(
+        target=process_message,
+        args=(event.source.user_id, None, image_b64),
+        daemon=True,
+    ).start()
+
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 1000)))
+    if not os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or not os.getenv("LINE_CHANNEL_SECRET"):
+        raise RuntimeError("LINE credentials are not configured")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 1000)))
+
