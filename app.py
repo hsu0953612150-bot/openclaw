@@ -12,7 +12,7 @@ import urllib.request
 import wave
 
 import gspread
-from flask import Flask, abort, request
+from flask import Flask, abort, render_template, request
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -44,6 +44,8 @@ SHEET_NAME = os.getenv("GOOGLE_SHEET_TAB", "UserMemory")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://openclaw-jc14.onrender.com").rstrip("/")
 AUDIO_URL_TTL_SECONDS = 15 * 60
 MAX_HISTORY_MESSAGES = max(2, int(os.getenv("MAX_HISTORY_MESSAGES", "8")))
+GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+LIVE_TICKET_TTL_SECONDS = 10 * 60
 
 SYSTEM_INSTRUCTION = """你是 LINE 官方帳號「大G」的 AI 助理，使用繁體中文回答。
 只回答使用者實際提出的問題。若使用者只說「測試訊息」、問候或沒有提出具體問題，簡短確認收到即可，不要猜測主題或補充無關建議。
@@ -52,6 +54,8 @@ SYSTEM_INSTRUCTION = """你是 LINE 官方帳號「大G」的 AI 助理，使用
 _sheet_lock = threading.Lock()
 _audio_lock = threading.Lock()
 _audio_cache = {}
+_live_ticket_lock = threading.Lock()
+_live_tickets = {}
 
 
 @app.get("/")
@@ -69,6 +73,64 @@ def health():
         and SPREADSHEET_ID
     )
     return {"ok": configured, "service": "daga-line-gemini", "model": GEMINI_MODEL}, (200 if configured else 503)
+
+
+@app.get("/voice")
+def live_voice_page():
+    return render_template("live_voice.html")
+
+
+@app.post("/api/live-token")
+def create_live_token():
+    payload = request.get_json(silent=True) or {}
+    ticket = payload.get("ticket")
+    if not isinstance(ticket, str) or len(ticket) > 128:
+        return {"error": "Invalid or expired voice session link."}, 401
+
+    with _live_ticket_lock:
+        now = time.time()
+        for expired_ticket in [key for key, value in _live_tickets.items() if value["expires_at"] <= now]:
+            _live_tickets.pop(expired_ticket, None)
+        ticket_info = _live_tickets.pop(ticket, None)
+
+    if not ticket_info or ticket_info["expires_at"] <= now:
+        return {"error": "This voice session link expired or was already used. Send 即時語音 in LINE to get a new one."}, 401
+
+    if not GEMINI_API_KEY:
+        return {"error": "Gemini Live is not configured."}, 503
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    live_model = f"models/{GEMINI_LIVE_MODEL.removeprefix('models/')}"
+    token_body = json.dumps({
+        "uses": 1,
+        "expireTime": (now_utc + datetime.timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
+        "newSessionExpireTime": (now_utc + datetime.timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+        "liveConnectConstraints": {
+            "model": live_model,
+            "config": {"responseModalities": ["AUDIO"]},
+        },
+    }).encode("utf-8")
+    token_request = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/auth_tokens",
+        data=token_body,
+        headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(token_request, timeout=20) as response:
+            token_result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        app.logger.exception("Could not create Gemini Live ephemeral token (HTTP %s)", error.code)
+        return {"error": "Could not start a live voice session. Please try again later."}, 502
+    except (urllib.error.URLError, TimeoutError):
+        app.logger.exception("Could not reach Gemini Live token service")
+        return {"error": "Could not reach Gemini Live. Please try again later."}, 502
+
+    token = token_result.get("name")
+    if not token:
+        app.logger.error("Gemini Live token response did not include a token name")
+        return {"error": "Gemini Live returned an invalid session token."}, 502
+    return {"token": token, "model": live_model}, 200
 
 
 @app.get("/audio/<token>.mp3")
@@ -104,17 +166,8 @@ def get_gspread_client():
     raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
     if not raw:
         raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON is not configured")
-    try:
-        info = json.loads(raw)
-        if isinstance(info, str):
-            info = json.loads(info)
-    except json.JSONDecodeError as error:
-        raise ValueError("GCP_SERVICE_ACCOUNT_JSON must contain valid service account JSON") from error
-    if not isinstance(info, dict):
-        raise ValueError("GCP_SERVICE_ACCOUNT_JSON must contain a JSON object")
-    private_key = info.get("private_key")
-    if isinstance(private_key, str):
-        info["private_key"] = private_key.replace("\\n", "\n")
+    normalized = raw.replace("\\\\n", "\n").replace("\\n", "\n").strip()
+    info = json.loads(normalized)
     scopes = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
@@ -163,9 +216,8 @@ def gemini_generate(history, image_b64=None, audio_b64=None, audio_mime_type="au
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured on the service")
     contents = []
-    selected_history = history[-MAX_HISTORY_MESSAGES:]
-    for index, message in enumerate(selected_history):
-        if audio_b64 and index == len(selected_history) - 1 and message.get("content") == "[語音訊息]":
+    for index, message in enumerate(history[-MAX_HISTORY_MESSAGES:]):
+        if audio_b64 and index == len(history[-MAX_HISTORY_MESSAGES:]) - 1 and message.get("content") == "[語音訊息]":
             continue
         role = "model" if message.get("role") == "assistant" else "user"
         content = message.get("content", "")
@@ -178,7 +230,6 @@ def gemini_generate(history, image_b64=None, audio_b64=None, audio_mime_type="au
                 {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
             ],
         })
-
     if audio_b64:
         contents.append({
             "role": "user",
@@ -328,7 +379,7 @@ def process_message(user_id, user_text=None, image_b64=None, audio_b64=None, aud
         elif image_b64:
             history.append({"role": "user", "content": "[圖片]"})
         elif audio_b64:
-            # Store a marker instead of the voice transcript.
+            # Keep a marker in conversation context; do not persist a voice transcript.
             history.append({"role": "user", "content": "[語音訊息]"})
         answer = gemini_generate(
             history,
@@ -361,6 +412,31 @@ def process_message(user_id, user_text=None, image_b64=None, audio_b64=None, aud
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
     app.logger.info("Received LINE text event")
+    if event.message.text.strip() in {"即時語音", "即時對話", "開始即時語音", "開始即時對話"}:
+        ticket = secrets.token_urlsafe(32)
+        with _live_ticket_lock:
+            now = time.time()
+            for expired_ticket in [key for key, value in _live_tickets.items() if value["expires_at"] <= now]:
+                _live_tickets.pop(expired_ticket, None)
+            _live_tickets[ticket] = {
+                "user_id": event.source.user_id,
+                "expires_at": now + LIVE_TICKET_TTL_SECONDS,
+            }
+        voice_url = f"{PUBLIC_BASE_URL}/voice#ticket={ticket}"
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=(
+                        "🎙️ 點下面連結進入大G即時語音對話。開啟後按「開始」，並允許使用麥克風。\n"
+                        "語音會即時傳給 Gemini 回應；此即時語音工作階段不會存入對話試算表。\n"
+                        f"{voice_url}"
+                    ))],
+                )
+            )
+        app.logger.info("Issued a one-time live voice link for a LINE user")
+        return
+
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(
