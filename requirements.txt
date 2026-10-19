@@ -1,7 +1,5 @@
 flask
 line-bot-sdk>=3.0.0
-openai
-tavily-python
 gspread
 oauth2client
 playwright
