@@ -78,8 +78,17 @@ def get_gspread_client():
     raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
     if not raw:
         raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON is not configured")
-    normalized = raw.replace("\\\\n", "\n").replace("\\n", "\n").strip()
-    info = json.loads(normalized)
+    try:
+        info = json.loads(raw)
+        if isinstance(info, str):
+            info = json.loads(info)
+    except json.JSONDecodeError as error:
+        raise ValueError("GCP_SERVICE_ACCOUNT_JSON must contain valid service account JSON") from error
+    if not isinstance(info, dict):
+        raise ValueError("GCP_SERVICE_ACCOUNT_JSON must contain a JSON object")
+    private_key = info.get("private_key")
+    if isinstance(private_key, str):
+        info["private_key"] = private_key.replace("\\n", "\n")
     scopes = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
