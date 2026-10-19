@@ -45,7 +45,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://openclaw-jc14.onrender.c
 AUDIO_URL_TTL_SECONDS = 15 * 60
 MAX_HISTORY_MESSAGES = max(2, int(os.getenv("MAX_HISTORY_MESSAGES", "8")))
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
-LIVE_TICKET_TTL_SECONDS = 10 * 60
+LIVE_TOKEN_LIMIT_PER_HOUR = max(1, int(os.getenv("LIVE_TOKEN_LIMIT_PER_HOUR", "30")))
 
 SYSTEM_INSTRUCTION = """你是 LINE 官方帳號「大G」的 AI 助理，使用繁體中文回答。
 只回答使用者實際提出的問題。若使用者只說「測試訊息」、問候或沒有提出具體問題，簡短確認收到即可，不要猜測主題或補充無關建議。
@@ -54,8 +54,8 @@ SYSTEM_INSTRUCTION = """你是 LINE 官方帳號「大G」的 AI 助理，使用
 _sheet_lock = threading.Lock()
 _audio_lock = threading.Lock()
 _audio_cache = {}
-_live_ticket_lock = threading.Lock()
-_live_tickets = {}
+_live_token_lock = threading.Lock()
+_live_token_requests = []
 
 
 @app.get("/")
@@ -82,19 +82,12 @@ def live_voice_page():
 
 @app.post("/api/live-token")
 def create_live_token():
-    payload = request.get_json(silent=True) or {}
-    ticket = payload.get("ticket")
-    if not isinstance(ticket, str) or len(ticket) > 128:
-        return {"error": "Invalid or expired voice session link."}, 401
-
-    with _live_ticket_lock:
-        now = time.time()
-        for expired_ticket in [key for key, value in _live_tickets.items() if value["expires_at"] <= now]:
-            _live_tickets.pop(expired_ticket, None)
-        ticket_info = _live_tickets.pop(ticket, None)
-
-    if not ticket_info or ticket_info["expires_at"] <= now:
-        return {"error": "This voice session link expired or was already used. Send 即時語音 in LINE to get a new one."}, 401
+    now = time.time()
+    with _live_token_lock:
+        _live_token_requests[:] = [timestamp for timestamp in _live_token_requests if now - timestamp < 3600]
+        if len(_live_token_requests) >= LIVE_TOKEN_LIMIT_PER_HOUR:
+            return {"error": "目前即時語音使用次數已達暫時上限，請稍後再試。"}, 429
+        _live_token_requests.append(now)
 
     if not GEMINI_API_KEY:
         return {"error": "Gemini Live is not configured."}, 503
@@ -412,31 +405,6 @@ def process_message(user_id, user_text=None, image_b64=None, audio_b64=None, aud
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
     app.logger.info("Received LINE text event")
-    if event.message.text.strip() in {"即時語音", "即時對話", "開始即時語音", "開始即時對話"}:
-        ticket = secrets.token_urlsafe(32)
-        with _live_ticket_lock:
-            now = time.time()
-            for expired_ticket in [key for key, value in _live_tickets.items() if value["expires_at"] <= now]:
-                _live_tickets.pop(expired_ticket, None)
-            _live_tickets[ticket] = {
-                "user_id": event.source.user_id,
-                "expires_at": now + LIVE_TICKET_TTL_SECONDS,
-            }
-        voice_url = f"{PUBLIC_BASE_URL}/voice#ticket={ticket}"
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=(
-                        "🎙️ 點下面連結進入大G即時語音對話。開啟後按「開始」，並允許使用麥克風。\n"
-                        "語音會即時傳給 Gemini 回應；此即時語音工作階段不會存入對話試算表。\n"
-                        f"{voice_url}"
-                    ))],
-                )
-            )
-        app.logger.info("Issued a one-time live voice link for a LINE user")
-        return
-
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(
