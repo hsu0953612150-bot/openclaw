@@ -3,7 +3,6 @@ import threading
 import json
 import base64
 import gspread
-from gspread.exceptions import CellNotFound
 import datetime
 from flask import Flask, request, abort
 
@@ -52,12 +51,8 @@ def get_gspread_client():
         raise
 
 def find_user_row(sheet, user_id):
-    # gspread.find() raises CellNotFound when the user has no row yet.
-    # Convert that expected first-message case into None so the caller can append.
-    try:
-        return sheet.find(user_id, in_column=1)
-    except CellNotFound:
-        return None
+    # Search only the user-ID column; gspread.find() returns None when not found.
+    return sheet.find(user_id, in_column=1)
 
 def get_user_memory(user_id):
     try:
