@@ -19,7 +19,7 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import ImageMessageContent, MessageEvent, TextMessageContent
+from linebot.v3.webhooks import AudioMessageContent, ImageMessageContent, MessageEvent, TextMessageContent
 from oauth2client.service_account import ServiceAccountCredentials
 
 
@@ -133,11 +133,14 @@ def save_history(user_id, history):
     app.logger.info("Google Sheets write succeeded (conversation history updated)")
 
 
-def gemini_generate(history, image_b64=None):
+def gemini_generate(history, image_b64=None, audio_b64=None, audio_mime_type="audio/m4a"):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured on the service")
     contents = []
-    for message in history[-MAX_HISTORY_MESSAGES:]:
+    selected_history = history[-MAX_HISTORY_MESSAGES:]
+    for index, message in enumerate(selected_history):
+        if audio_b64 and index == len(selected_history) - 1 and message.get("content") == "[語音訊息]":
+            continue
         role = "model" if message.get("role") == "assistant" else "user"
         content = message.get("content", "")
         contents.append({"role": role, "parts": [{"text": str(content)}]})
@@ -147,6 +150,15 @@ def gemini_generate(history, image_b64=None):
             "parts": [
                 {"text": "請根據使用者傳來的圖片內容回答。"},
                 {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
+            ],
+        })
+
+    if audio_b64:
+        contents.append({
+            "role": "user",
+            "parts": [
+                {"text": "請聆聽這段 LINE 語音，理解使用者以繁體中文表達的內容並直接回覆。除非使用者要求逐字稿，否則不要只輸出逐字轉錄。"},
+                {"inline_data": {"mime_type": audio_mime_type, "data": audio_b64}},
             ],
         })
 
@@ -188,7 +200,7 @@ def send_text(user_id, text):
         )
 
 
-def process_message(user_id, user_text=None, image_b64=None):
+def process_message(user_id, user_text=None, image_b64=None, audio_b64=None, audio_mime_type="audio/m4a"):
     try:
         try:
             history = load_history(user_id)
@@ -199,7 +211,15 @@ def process_message(user_id, user_text=None, image_b64=None):
             history.append({"role": "user", "content": user_text})
         elif image_b64:
             history.append({"role": "user", "content": "[圖片]"})
-        answer = gemini_generate(history, image_b64=image_b64)
+        elif audio_b64:
+            # Store a marker instead of the voice transcript.
+            history.append({"role": "user", "content": "[語音訊息]"})
+        answer = gemini_generate(
+            history,
+            image_b64=image_b64,
+            audio_b64=audio_b64,
+            audio_mime_type=audio_mime_type,
+        )
         history.append({"role": "assistant", "content": answer})
         try:
             save_history(user_id, history)
@@ -248,6 +268,37 @@ def handle_image(event):
     threading.Thread(
         target=process_message,
         args=(event.source.user_id, None, image_b64),
+        daemon=True,
+    ).start()
+
+
+def process_audio_message(user_id, message_id):
+    try:
+        with ApiClient(configuration) as api_client:
+            audio_content = MessagingApiBlob(api_client).get_message_content(message_id)
+        audio_b64 = base64.b64encode(audio_content).decode("ascii")
+        process_message(user_id, audio_b64=audio_b64, audio_mime_type="audio/m4a")
+    except Exception:
+        app.logger.exception("Could not retrieve or process LINE audio message")
+        try:
+            send_text(user_id, "我目前無法讀取這段語音，請稍後再傳一次，或改用文字訊息。")
+        except Exception:
+            app.logger.exception("Could not send LINE audio error reply")
+
+
+@handler.add(MessageEvent, message=AudioMessageContent)
+def handle_audio(event):
+    app.logger.info("Received LINE audio event")
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="🎧 收到語音，我正在聆聽並整理回覆。")],
+            )
+        )
+    threading.Thread(
+        target=process_audio_message,
+        args=(event.source.user_id, event.message.id),
         daemon=True,
     ).start()
 
