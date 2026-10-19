@@ -1,10 +1,15 @@
 import base64
 import datetime
+import io
 import json
 import os
+import secrets
+import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
+import wave
 
 import gspread
 from flask import Flask, abort, request
@@ -36,6 +41,8 @@ SPREADSHEET_ID = (
     else SPREADSHEET_RAW_ID
 )
 SHEET_NAME = os.getenv("GOOGLE_SHEET_TAB", "UserMemory")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://openclaw-jc14.onrender.com").rstrip("/")
+AUDIO_URL_TTL_SECONDS = 15 * 60
 MAX_HISTORY_MESSAGES = max(2, int(os.getenv("MAX_HISTORY_MESSAGES", "8")))
 
 SYSTEM_INSTRUCTION = """你是 LINE 官方帳號「大G」的 AI 助理，使用繁體中文回答。
@@ -43,6 +50,8 @@ SYSTEM_INSTRUCTION = """你是 LINE 官方帳號「大G」的 AI 助理，使用
 回答清楚、親切、精簡；不要聲稱已保存資料或完成外部操作，除非系統已明確完成。"""
 
 _sheet_lock = threading.Lock()
+_audio_lock = threading.Lock()
+_audio_cache = {}
 
 
 @app.get("/")
@@ -60,6 +69,23 @@ def health():
         and SPREADSHEET_ID
     )
     return {"ok": configured, "service": "daga-line-gemini", "model": GEMINI_MODEL}, (200 if configured else 503)
+
+
+@app.get("/audio/<token>.mp3")
+def get_generated_audio(token):
+    now = time.time()
+    with _audio_lock:
+        expired = [key for key, item in _audio_cache.items() if item[1] < now]
+        for key in expired:
+            _audio_cache.pop(key, None)
+        item = _audio_cache.get(token)
+    if not item:
+        abort(404)
+    return app.response_class(
+        item[0],
+        mimetype="audio/mpeg",
+        headers={"Cache-Control": "public, max-age=300", "Content-Disposition": "inline"},
+    )
 
 
 @app.post("/callback")
@@ -200,6 +226,96 @@ def send_text(user_id, text):
         )
 
 
+def synthesize_reply_audio(text):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured on the service")
+    speak_text = text[:1200]
+    body = json.dumps({
+        "model": os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts"),
+        "input": [{
+            "type": "user_input",
+            "content": [{
+                "type": "text",
+                "text": speak_text,
+                "annotations": [{
+                    "type": "speech_metadata",
+                    "style": "Use clear, natural Traditional Chinese with a warm conversational tone.",
+                }],
+            }],
+        }],
+        "response_format": {"type": "audio"},
+        "generation_config": {"speech_config": [{"voice": os.getenv("GEMINI_TTS_VOICE", "Kore")}]},
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/interactions",
+        data=body,
+        headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"Gemini TTS returned HTTP {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Gemini TTS connection failed: {error.reason}") from error
+
+    audio_data = next((
+        part.get("data")
+        for step in result.get("steps", [])
+        if step.get("type") == "model_output"
+        for part in step.get("content", [])
+        if part.get("type") == "audio" and part.get("data")
+    ), None)
+    if not audio_data:
+        raise RuntimeError("Gemini TTS returned no audio data")
+    wav_bytes = base64.b64decode(audio_data)
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+        duration_ms = max(1, int(wav_file.getnframes() * 1000 / wav_file.getframerate()))
+    converted = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-f", "mp3", "-codec:a", "libmp3lame", "-b:a", "96k", "pipe:1"],
+        input=wav_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        timeout=30,
+    ).stdout
+    if not converted:
+        raise RuntimeError("Audio conversion produced an empty MP3")
+    return converted, duration_ms
+
+
+def send_voice_reply(user_id, text):
+    audio_mp3, duration_ms = synthesize_reply_audio(text)
+    token = secrets.token_urlsafe(24)
+    expires_at = time.time() + AUDIO_URL_TTL_SECONDS
+    with _audio_lock:
+        _audio_cache[token] = (audio_mp3, expires_at, duration_ms)
+    audio_url = f"{PUBLIC_BASE_URL}/audio/{token}.mp3"
+    payload = json.dumps({
+        "to": user_id,
+        "messages": [
+            {"type": "text", "text": text},
+            {"type": "audio", "originalContentUrl": audio_url, "duration": duration_ms},
+        ],
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.line.me/v2/bot/message/push",
+        data=payload,
+        headers={"Authorization": f"Bearer {os.getenv('LINE_CHANNEL_ACCESS_TOKEN')}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status >= 300:
+                raise RuntimeError(f"LINE audio reply returned HTTP {response.status}")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"LINE audio reply returned HTTP {error.code}: {detail}") from error
+    app.logger.info("LINE text and voice reply sent successfully")
+
+
 def process_message(user_id, user_text=None, image_b64=None, audio_b64=None, audio_mime_type="audio/m4a"):
     try:
         try:
@@ -225,7 +341,14 @@ def process_message(user_id, user_text=None, image_b64=None, audio_b64=None, aud
             save_history(user_id, history)
         except Exception:
             app.logger.exception("Google Sheets write failed; AI reply will still be sent")
-        send_text(user_id, answer)
+        if audio_b64:
+            try:
+                send_voice_reply(user_id, answer)
+            except Exception:
+                app.logger.exception("Voice reply failed; sending the text reply instead")
+                send_text(user_id, answer)
+        else:
+            send_text(user_id, answer)
         app.logger.info("LINE final reply sent successfully")
     except Exception as error:
         app.logger.exception("LINE/Gemini message processing failed")
