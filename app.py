@@ -244,7 +244,12 @@ def gemini_generate(history, image_b64=None, audio_b64=None, audio_mime_type="au
     body = json.dumps({
         "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": 800},
+        # This bot primarily handles short LINE turns; keep reasoning latency low
+        # so requests do not hit the webhook worker's response timeout.
+        "generationConfig": {
+            "maxOutputTokens": 800,
+            "thinkingConfig": {"thinkingLevel": "low"},
+        },
     }).encode("utf-8")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     request = urllib.request.Request(
