@@ -97,10 +97,11 @@ def create_live_token():
     token_body = json.dumps({
         "uses": 1,
         "expireTime": (now_utc + datetime.timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
-        "newSessionExpireTime": (now_utc + datetime.timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
-        "liveConnectConstraints": {
+        "newSessionExpireTime": (now_utc + datetime.timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+        "fieldMask": "model,generationConfig.responseModalities",
+        "bidiGenerateContentSetup": {
             "model": live_model,
-            "config": {"responseModalities": ["AUDIO"]},
+            "generationConfig": {"responseModalities": ["AUDIO"]},
         },
     }).encode("utf-8")
     token_request = urllib.request.Request(
@@ -113,7 +114,15 @@ def create_live_token():
         with urllib.request.urlopen(token_request, timeout=20) as response:
             token_result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        app.logger.exception("Could not create Gemini Live ephemeral token (HTTP %s)", error.code)
+        try:
+            provider_error = error.read().decode("utf-8", errors="replace")
+        except Exception:
+            provider_error = "<response body unavailable>"
+        app.logger.error(
+            "Could not create Gemini Live ephemeral token (HTTP %s): %s",
+            error.code,
+            provider_error[:2000],
+        )
         return {"error": "Could not start a live voice session. Please try again later."}, 502
     except (urllib.error.URLError, TimeoutError):
         app.logger.exception("Could not reach Gemini Live token service")
