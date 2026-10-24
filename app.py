@@ -33,6 +33,7 @@ configuration = Configuration(access_token=os.getenv("LINE_CHANNEL_ACCESS_TOKEN"
 handler = WebhookHandler(os.getenv("LINE_CHANNEL_SECRET"))
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 SPREADSHEET_RAW_ID = os.getenv("SPREADSHEET_ID", "")
 SPREADSHEET_ID = (
@@ -251,21 +252,34 @@ def gemini_generate(history, image_b64=None, audio_b64=None, audio_mime_type="au
             "thinkingConfig": {"thinkingLevel": "low"},
         },
     }).encode("utf-8")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")[:1000]
-        raise RuntimeError(f"Gemini API returned HTTP {error.code}: {detail}") from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"Gemini API connection failed: {error.reason}") from error
+    models = list(dict.fromkeys((GEMINI_MODEL, GEMINI_FALLBACK_MODEL)))
+    result = None
+    selected_model = None
+    for model_index, model in enumerate(models):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            selected_model = model
+            break
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:1000]
+            if error.code == 503 and model_index + 1 < len(models):
+                app.logger.warning(
+                    "Gemini model %s is overloaded (HTTP 503); trying fallback model %s",
+                    model,
+                    models[model_index + 1],
+                )
+                continue
+            raise RuntimeError(f"Gemini API returned HTTP {error.code}: {detail}") from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"Gemini API connection failed: {error.reason}") from error
 
     answer = "".join(
         part.get("text", "")
@@ -273,7 +287,7 @@ def gemini_generate(history, image_b64=None, audio_b64=None, audio_mime_type="au
     ).strip()
     if not answer:
         raise RuntimeError("Gemini returned an empty response")
-    app.logger.info("Gemini request succeeded (model=%s)", GEMINI_MODEL)
+    app.logger.info("Gemini request succeeded (model=%s)", selected_model)
     return answer[:4900]
 
 
