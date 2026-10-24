@@ -212,14 +212,16 @@ def _load_index(folder_id):
                 continue
             remaining_bytes -= len(data)
             text = _extract_text(item.get("name", ""), item.get("mimeType", ""), data)
-            if text:
+            is_pdf = item.get("mimeType") == "application/pdf" or item.get("name", "").lower().endswith(".pdf")
+            if text or is_pdf:
                 indexed.append({
                     "id": item["id"],
                     "name": item.get("name", "未命名文件"),
                     "mime_type": item.get("mimeType", "application/octet-stream"),
                     "modified_time": item.get("modifiedTime", ""),
-                    "chunks": _split_text(text[:MAX_INDEX_CHARS_PER_FILE]),
-                    "is_pdf": item.get("mimeType") == "application/pdf" or item.get("name", "").lower().endswith(".pdf"),
+                    "chunks": _split_text(text[:MAX_INDEX_CHARS_PER_FILE]) or [item.get("name", "未命名文件")],
+                    "has_text": bool(text),
+                    "is_pdf": is_pdf,
                 })
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
             continue
@@ -254,6 +256,11 @@ def retrieve_knowledge(query):
         seen.add(item["id"])
         if len(selected) >= 4:
             break
+    if not selected and query_terms:
+        scanned_pdfs = [item for item in files if item["is_pdf"] and not item["has_text"]]
+        if len(scanned_pdfs) == 1:
+            item = scanned_pdfs[0]
+            selected = [(1, item, "這份 PDF 沒有可擷取文字，將由 Gemini 直接辨識頁面內容。")]
     if not selected and not query_terms:
         selected = [(0, item, item["chunks"][0]) for item in files[:3] if item["chunks"]]
     if not selected:
