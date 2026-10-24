@@ -280,10 +280,11 @@ def gemini_generate(history, image_b64=None, audio_b64=None, audio_mime_type="au
             raise RuntimeError(f"Gemini API request timed out for model {model}") from error
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:1000]
-            if error.code == 503 and model_index + 1 < len(models):
+            if error.code in (429, 503) and model_index + 1 < len(models):
                 app.logger.warning(
-                    "Gemini model %s is overloaded (HTTP 503); trying fallback model %s",
+                    "Gemini model %s returned HTTP %s; trying fallback model %s",
                     model,
+                    error.code,
                     models[model_index + 1],
                 )
                 continue
