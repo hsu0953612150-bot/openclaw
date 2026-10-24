@@ -169,8 +169,9 @@ def get_gspread_client():
     raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
     if not raw:
         raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON is not configured")
-    normalized = raw.replace("\\\\n", "\n").replace("\\n", "\n").strip()
-    info = json.loads(normalized)
+    # Let json.loads decode escaped newlines inside fields such as private_key.
+    # Replacing the literal ``\\n`` first makes otherwise valid JSON invalid.
+    info = json.loads(raw.strip())
     scopes = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
@@ -264,10 +265,19 @@ def gemini_generate(history, image_b64=None, audio_b64=None, audio_mime_type="au
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=45) as response:
+            with urllib.request.urlopen(request, timeout=20 if model_index == 0 else 30) as response:
                 result = json.loads(response.read().decode("utf-8"))
             selected_model = model
             break
+        except TimeoutError as error:
+            if model_index + 1 < len(models):
+                app.logger.warning(
+                    "Gemini model %s timed out; trying fallback model %s",
+                    model,
+                    models[model_index + 1],
+                )
+                continue
+            raise RuntimeError(f"Gemini API request timed out for model {model}") from error
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:1000]
             if error.code == 503 and model_index + 1 < len(models):
