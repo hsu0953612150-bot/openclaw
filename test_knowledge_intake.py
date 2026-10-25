@@ -43,6 +43,14 @@ class IntakeTests(unittest.TestCase):
         self.assertEqual(intake.extract_urls("請打開[資料](https://example.com/guide)"), ["https://example.com/guide"])
         self.assertFalse(intake.video_site("https://youtube.com.example.org/watch?v=123"))
 
+    def test_followup_resumes_failed_video_but_not_successful_or_unrelated_history(self):
+        url = "https://youtu.be/JliBOtyT0Oc"
+        failed = [{"role": "user", "content": url}, {"role": "assistant", "content": "素材已保留，狀態：待處理。\n內容處理逾時"}, {"role": "user", "content": "剛才資料有哪些重點？"}]
+        self.assertEqual(intake.retry_sources_from_history("剛才資料有哪些重點？", failed), [url])
+        self.assertEqual(intake.retry_sources_from_history("上次我住在哪裡？", failed), [])
+        succeeded = [failed[0], {"role": "assistant", "content": "影片已分析完成，以下是摘要。"}, failed[2]]
+        self.assertEqual(intake.retry_sources_from_history("剛才資料有哪些重點？", succeeded), [])
+
     def test_private_addresses_are_rejected(self):
         for address in ("127.0.0.1", "10.0.0.1", "169.254.169.254", "::1"):
             with patch.object(socket, "getaddrinfo", return_value=[(0, 0, 0, "", (address, 443))]):
@@ -163,6 +171,23 @@ class IntakeTests(unittest.TestCase):
         content, partial = intake.model_input("notes.txt", b"a" * (intake.MAX_TEXT + 1), "text/plain")
         self.assertTrue(partial)
         self.assertIn("僅部分內容", content["text"])
+
+    @patch.object(intake, "upload_gemini_video", return_value={"type": "video", "uri": "https://example.com/uploaded", "_temporary_gemini_file": "files/test-file"})
+    def test_large_platform_video_uses_file_reference_instead_of_inline_base64(self, upload):
+        content, partial = intake.model_input("video.mp4", b"v" * (intake.MAX_BYTES + 1), "video/mp4")
+        self.assertEqual(content["uri"], "https://example.com/uploaded")
+        self.assertNotIn("data", content)
+        self.assertFalse(partial)
+        upload.assert_called_once()
+
+    @patch.object(intake, "delete_gemini_file")
+    @patch.object(intake, "_analyze", side_effect=TimeoutError())
+    @patch.object(intake, "model_input", return_value=({"type": "video", "uri": "https://example.com/uploaded", "_temporary_gemini_file": "files/test-file"}, False))
+    def test_model_file_is_cleaned_up_when_analysis_times_out(self, model_input, analyze, cleanup):
+        result = intake.ingest("video.mp4", "owner", data=b"test-video", filename="video.mp4", cloud=ArchiveCloud(deny=True))
+        self.assertEqual(result["status"], "待處理")
+        cleanup.assert_called_once_with("files/test-file")
+        self.assertNotIn("_temporary_gemini_file", analyze.call_args.args[0])
 
     @patch.object(intake, "_analyze", return_value=dict(ANALYSIS))
     def test_queued_material_can_sync_without_resending_or_reanalysis(self, analyze):

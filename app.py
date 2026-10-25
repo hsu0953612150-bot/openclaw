@@ -28,7 +28,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import AudioMessageContent, FileMessageContent, ImageMessageContent, MessageEvent, TextMessageContent, VideoMessageContent
 from oauth2client.service_account import ServiceAccountCredentials
 from drive_knowledge import retrieve_knowledge
-from knowledge_intake import MAX_BYTES as MAX_KNOWLEDGE_BYTES, extract_urls, ingest as ingest_resource, retrieve as retrieve_video_knowledge
+from knowledge_intake import MAX_BYTES as MAX_KNOWLEDGE_BYTES, extract_urls, ingest as ingest_resource, retrieve as retrieve_video_knowledge, retry_sources_from_history
 from gemini_errors import GeminiQuotaError, is_project_quota_exhausted, user_facing_reply
 from openai_fallback import (
     OPENAI_REALTIME_MODEL,
@@ -104,7 +104,7 @@ def health():
         "ok": configured,
         "service": "daga-line-gemini",
         "model": GEMINI_MODEL,
-        "knowledge_intake": "links-files-v1",
+        "knowledge_intake": "links-files-v2",
         "knowledge_cloud_configured": bool(os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN") and os.getenv("GOOGLE_DRIVE_FOLDER_ID")),
     }, (200 if configured else 503)
 
@@ -718,6 +718,8 @@ def process_message(
             # Keep a marker in conversation context; do not persist a voice transcript.
             history.append({"role": "user", "content": "[語音訊息]"})
         resource_urls = extract_urls(user_text or "") if not (image_b64 or audio_b64) else []
+        if not resource_urls and file_data is None and not (image_b64 or audio_b64):
+            resource_urls = retry_sources_from_history(user_text or "", history)
         if resource_urls or file_data is not None:
             # New user-shared materials are analyzed independently of old retrieval hits.
             intake_results = []

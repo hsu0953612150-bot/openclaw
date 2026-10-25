@@ -19,7 +19,7 @@ import urllib.request
 import zipfile
 import xml.etree.ElementTree as ET
 
-from video_knowledge import Cloud, MAX_MEDIA_BYTES, VIDEO_HOSTS, _analyze, _download, canonical_url, load_local_env, now, record_answer, retrieve as retrieve_cloud, safe_error
+from video_knowledge import Cloud, MAX_MEDIA_BYTES, MAX_REMOTE_VIDEO_BYTES, VIDEO_HOSTS, _analyze, _download, canonical_url, delete_gemini_file, load_local_env, now, record_answer, retrieve as retrieve_cloud, safe_error, upload_gemini_video
 
 
 MAX_BYTES = MAX_MEDIA_BYTES
@@ -40,6 +40,24 @@ summary最多600字；每個清單最多12項，每項最多300字。不得聲�
 
 def extract_urls(text):
     return list(dict.fromkeys(u.rstrip(".,!?，。！？") for u in re.findall(r"https?://[^\s<>\]\)]+", text or "")))[:3]
+
+
+def retry_sources_from_history(query, history):
+    """An explicit follow-up can resume the last failed link without asking for it again."""
+    if not re.search(r"剛才|刚才|上次|上一|那支|那份|重試|重试|重新分析", query or ""):
+        return []
+    if not re.search(r"影片|資料|资料|素材|重點|重点|內容|内容|分析|重試|重试", query or ""):
+        return []
+    pending_prefixes = ("素材已保留，狀態：待處理", "影片連結已保留，狀態：待處理", "影片流程未能完成雲端保存", "這份素材未能完成讀取")
+    pending = False
+    for item in reversed(history):
+        if item.get("role") == "assistant":
+            if pending or not str(item.get("content", "")).startswith(pending_prefixes):
+                return []
+            pending = True
+        elif pending and item.get("role") == "user":
+            return extract_urls(str(item.get("content", "")))
+    return []
 
 
 def video_site(url):
@@ -174,6 +192,8 @@ def model_input(name, data, mime):
     elif data.startswith(b"\xff\xd8\xff"):
         mime = "image/jpeg"
     if mime.startswith(("image/", "audio/", "video/")):
+        if mime == "video/mp4" and len(data) > MAX_MEDIA_BYTES:
+            return upload_gemini_video(data, name), False
         return {"type": mime.split("/")[0], "mime_type": mime, "data": base64.b64encode(data).decode()}, False
     text, partial = document_text(name, data, mime)
     if not text.strip():
@@ -261,8 +281,9 @@ def _ingest(source, user_id, message="", entry="Codex", event_id="", data=None, 
                 filename, data, mime_type, final_url = fetch(source)
                 record["resolved_url"] = final_url
             if data is not None:
-                if not 0 < len(data) <= MAX_BYTES:
-                    raise RuntimeError("素材為空或超過12MB，保留待處理")
+                byte_limit = MAX_REMOTE_VIDEO_BYTES if is_url and video_site(source) else MAX_BYTES
+                if not 0 < len(data) <= byte_limit:
+                    raise RuntimeError("素材為空或超過處理大小限制，保留待處理")
                 filename = re.split(r"[/\\]", filename or "attachment.bin")[-1][:180]
                 mime_type = mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
                 if data.startswith(b"\x89PNG"):
@@ -276,10 +297,15 @@ def _ingest(source, user_id, message="", entry="Codex", event_id="", data=None, 
                 record.update(filename=filename, mime_type=mime_type, local_asset=asset_name, content_sha256=hashlib.sha256(data).hexdigest())
                 save_local(directory, record)
                 content, partial = model_input(filename, data, mime_type)
-            analysis = _analyze(content, message, prompt=CONTENT_PROMPT)
+            temporary_remote_file = content.pop("_temporary_gemini_file", None)
+            try:
+                analysis = _analyze(content, message, prompt=CONTENT_PROMPT)
+            finally:
+                if temporary_remote_file:
+                    delete_gemini_file(temporary_remote_file)
             category = analysis.get("category", "其他")
             analysis["category"] = category if isinstance(category, str) and category in CATEGORIES else "其他"
-            record.update(analysis=analysis, partial_content=partial, status="待同步", error="", model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
+            record.update(analysis=analysis, partial_content=partial, status="待同步", error="", model=analysis.get("analysis_model", os.getenv("GEMINI_MODEL", "gemini-3.8-flash")))
         except Exception as error:
             record.update(status="待處理", error=safe_error(error))
     record["cloud_saved"] = False
