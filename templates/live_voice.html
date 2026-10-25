@@ -35,7 +35,7 @@
     <button id="start" type="button">開始即時對話</button>
     <button id="stop" type="button">結束對話</button>
     <div id="transcript" aria-live="polite"></div>
-    <p class="privacy">開始後，麥克風音訊會即時傳送至 Google Gemini 產生回覆；這段即時語音不會存入大G的對話試算表。結束對話可立即停止麥克風。</p>
+    <p class="privacy">開始後，麥克風音訊會即時傳送至 Google Gemini；若 Gemini 額度用盡，會改傳至 OpenAI Realtime 產生回覆。這段即時語音不會存入大G的對話試算表。結束對話可立即停止麥克風。</p>
   </main>
   <script>
     const LIVE_MODEL_FALLBACK = 'models/gemini-3.8-live';
@@ -46,6 +46,9 @@
     const transcriptEl = document.querySelector('#transcript');
     const orb = document.querySelector('#orb');
     let socket;
+    let peerConnection;
+    let dataChannel;
+    let remoteAudio;
     let audioContext;
     let mediaStream;
     let processor;
@@ -191,6 +194,15 @@
       }
       if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
       socket = null;
+      dataChannel?.close();
+      dataChannel = null;
+      peerConnection?.close();
+      peerConnection = null;
+      if (remoteAudio) {
+        remoteAudio.pause();
+        remoteAudio.srcObject = null;
+        remoteAudio = null;
+      }
       outputGain?.disconnect();
       outputGain = null;
       if (audioContext) audioContext.close().catch(() => {});
@@ -199,6 +211,55 @@
       startButton.disabled = false;
       stopButton.style.display = 'none';
       if (!statusEl.classList.contains('error')) setStatus('已結束對話');
+    }
+
+    async function startOpenAIRealtime(secret, model) {
+      setStatus('正在連線至 OpenAI 即時語音…');
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      if (!live) return;
+      peerConnection = new RTCPeerConnection();
+      remoteAudio = document.createElement('audio');
+      remoteAudio.autoplay = true;
+      remoteAudio.playsInline = true;
+      remoteAudio.style.display = 'none';
+      document.body.appendChild(remoteAudio);
+      peerConnection.ontrack = (event) => {
+        remoteAudio.srcObject = event.streams[0];
+        remoteAudio.play().catch(() => {});
+      };
+      mediaStream.getTracks().forEach((track) => peerConnection.addTrack(track, mediaStream));
+      dataChannel = peerConnection.createDataChannel('oai-events');
+      dataChannel.addEventListener('open', () => {
+        setStatus('已連線至 OpenAI，請直接說話');
+        orb.classList.add('live');
+      });
+      dataChannel.addEventListener('message', (event) => {
+        let message;
+        try { message = JSON.parse(event.data); } catch { return; }
+        if (message.type === 'conversation.item.input_audio_transcription.completed') {
+          transcriptEl.textContent = `你：${message.transcript || ''}`;
+          setStatus('大G正在聆聽…');
+        } else if (message.type === 'response.output_audio_transcript.delta') {
+          transcriptEl.textContent = `大G：${(transcriptEl.textContent.startsWith('大G：') ? transcriptEl.textContent.slice(3) : '')}${message.delta || ''}`;
+          setStatus('大G正在回答…');
+        } else if (message.type === 'response.done') {
+          setStatus('已連線至 OpenAI，請直接說話');
+        } else if (message.type === 'error') {
+          console.error('OpenAI Realtime error', message.error);
+          setStatus('OpenAI 即時語音發生問題，請結束後重新開始。', true);
+        }
+      });
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      const response = await fetch('https://api.openai.com/v1/realtime/calls', {
+        method: 'POST',
+        body: offer.sdp,
+        headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/sdp' },
+      });
+      if (!response.ok) throw new Error('無法連線至 OpenAI 即時語音，請稍後再試。');
+      await peerConnection.setRemoteDescription({ type: 'answer', sdp: await response.text() });
     }
 
     async function startSession() {
@@ -219,6 +280,12 @@
         outputGain = audioContext.createGain();
         outputGain.connect(audioContext.destination);
         live = true;
+        startButton.style.display = 'none';
+        stopButton.style.display = 'block';
+        if (result.provider === 'openai') {
+          await startOpenAIRealtime(result.token, result.model);
+          return;
+        }
         socket = new WebSocket(
           `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(result.token)}`,
         );
@@ -246,9 +313,8 @@
             stopSession();
           }
         };
-        startButton.style.display = 'none';
-        stopButton.style.display = 'block';
       } catch (error) {
+        stopSession();
         setStatus(error.message || '無法開始即時對話，請稍後再試。', true);
         startButton.disabled = false;
       }
@@ -260,4 +326,5 @@
   </script>
 </body>
 </html>
+
 

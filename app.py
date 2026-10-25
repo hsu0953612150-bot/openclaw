@@ -30,7 +30,12 @@ from oauth2client.service_account import ServiceAccountCredentials
 from drive_knowledge import retrieve_knowledge
 from knowledge_intake import MAX_BYTES as MAX_KNOWLEDGE_BYTES, extract_urls, ingest as ingest_resource, retrieve as retrieve_video_knowledge
 from gemini_errors import GeminiQuotaError, is_project_quota_exhausted, user_facing_reply
-from openai_fallback import OpenAIFallbackUnavailable, generate_text_fallback
+from openai_fallback import (
+    OPENAI_REALTIME_MODEL,
+    OpenAIFallbackUnavailable,
+    create_realtime_client_secret,
+    generate_text_fallback,
+)
 
 
 app = Flask(__name__)
@@ -52,6 +57,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://openclaw-jc14.onrender.c
 AUDIO_URL_TTL_SECONDS = 15 * 60
 MAX_HISTORY_MESSAGES = max(2, int(os.getenv("MAX_HISTORY_MESSAGES", "8")))
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+LIVE_VOICE_INSTRUCTION = "你是 LINE 官方帳號「大G」的 AI 助理，使用繁體中文自然地進行即時語音對話。回答親切、清楚、簡潔。只回答使用者實際提出的問題，不要聲稱已完成外部操作或已保存資料。請以口語方式回答，不要讀出 Markdown 符號。"
 LIVE_TOKEN_LIMIT_PER_HOUR = max(1, int(os.getenv("LIVE_TOKEN_LIMIT_PER_HOUR", "30")))
 
 SYSTEM_INSTRUCTION = """你是 LINE 官方帳號「大G」的 AI 助理，使用繁體中文回答。
@@ -118,7 +124,7 @@ def create_live_token():
         _live_token_requests.append(now)
 
     if not GEMINI_API_KEY:
-        return {"error": "Gemini Live is not configured."}, 503
+        return _create_openai_live_fallback()
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     live_model = f"models/{GEMINI_LIVE_MODEL.removeprefix('models/')}"
@@ -146,11 +152,10 @@ def create_live_token():
             provider_error = error.read().decode("utf-8", errors="replace")
         except Exception:
             provider_error = "<response body unavailable>"
-        app.logger.error(
-            "Could not create Gemini Live ephemeral token (HTTP %s): %s",
-            error.code,
-            provider_error[:2000],
-        )
+        if is_project_quota_exhausted(error.code, provider_error):
+            app.logger.warning("Gemini Live quota exhausted; trying OpenAI Realtime fallback")
+            return _create_openai_live_fallback()
+        app.logger.error("Could not create Gemini Live ephemeral token (HTTP %s)", error.code)
         return {"error": "Could not start a live voice session. Please try again later."}, 502
     except (urllib.error.URLError, TimeoutError):
         app.logger.exception("Could not reach Gemini Live token service")
@@ -160,7 +165,21 @@ def create_live_token():
     if not token:
         app.logger.error("Gemini Live token response did not include a token name")
         return {"error": "Gemini Live returned an invalid session token."}, 502
-    return {"token": token, "model": live_model}, 200
+    return {"provider": "gemini", "token": token, "model": live_model}, 200
+
+
+def _create_openai_live_fallback():
+    try:
+        client_secret, model = create_realtime_client_secret(
+            model=OPENAI_REALTIME_MODEL,
+            instructions=LIVE_VOICE_INSTRUCTION,
+        )
+    except OpenAIFallbackUnavailable as error:
+        app.logger.error("OpenAI Realtime fallback unavailable: %s", error)
+        return {
+            "error": "Gemini 即時語音額度已用盡；OpenAI 即時語音備援尚未設定或目前無法連線，請稍後再試。"
+        }, 503
+    return {"provider": "openai", "token": client_secret, "model": model}, 200
 
 
 @app.get("/audio/<token>.mp3")

@@ -8,10 +8,60 @@ import urllib.request
 
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4.1-mini")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini")
 
 
 class OpenAIFallbackUnavailable(RuntimeError):
     """The fallback could not be used, usually because its API key is absent."""
+
+
+def create_realtime_client_secret(api_key=None, model=None, instructions=""):
+    """Create a short-lived browser secret for a Realtime WebRTC voice session."""
+    api_key = os.getenv("OPENAI_API_KEY", "") if api_key is None else api_key
+    if not api_key:
+        raise OpenAIFallbackUnavailable("OPENAI_API_KEY is not configured")
+
+    payload = json.dumps({
+        "expires_after": {"anchor": "created_at", "seconds": 600},
+        "session": {
+            "type": "realtime",
+            "model": model or OPENAI_REALTIME_MODEL,
+            "instructions": instructions,
+            "output_modalities": ["audio"],
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "transcription": {"model": "gpt-4o-mini-transcribe", "language": "zh"},
+                    "turn_detection": {"type": "server_vad"},
+                },
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "voice": "marin",
+                },
+            },
+            "max_output_tokens": 800,
+        },
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/realtime/client_secrets",
+        data=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise OpenAIFallbackUnavailable(f"OpenAI Realtime API returned HTTP {error.code}") from error
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+        raise OpenAIFallbackUnavailable(
+            f"OpenAI Realtime API request failed ({type(error).__name__})"
+        ) from error
+
+    value = result.get("value")
+    if not value:
+        raise OpenAIFallbackUnavailable("OpenAI returned no Realtime client secret")
+    return value, (result.get("session") or {}).get("model") or model or OPENAI_REALTIME_MODEL
 
 
 def generate_text_fallback(
@@ -114,3 +164,5 @@ def generate_text_fallback(
     if not answer:
         raise OpenAIFallbackUnavailable("OpenAI returned no text output")
     return answer[:4900]
+
+import json
