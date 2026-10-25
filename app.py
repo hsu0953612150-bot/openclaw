@@ -25,10 +25,10 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import AudioMessageContent, ImageMessageContent, MessageEvent, TextMessageContent
+from linebot.v3.webhooks import AudioMessageContent, FileMessageContent, ImageMessageContent, MessageEvent, TextMessageContent, VideoMessageContent
 from oauth2client.service_account import ServiceAccountCredentials
 from drive_knowledge import retrieve_knowledge
-from video_knowledge import extract_video_urls, ingest as ingest_video, retrieve as retrieve_video_knowledge
+from knowledge_intake import MAX_BYTES as MAX_KNOWLEDGE_BYTES, extract_urls, ingest as ingest_resource, retrieve as retrieve_video_knowledge
 from gemini_errors import GeminiQuotaError, is_project_quota_exhausted, user_facing_reply
 from openai_fallback import OpenAIFallbackUnavailable, generate_text_fallback
 
@@ -94,7 +94,13 @@ def health():
         and os.getenv("GCP_SERVICE_ACCOUNT_JSON")
         and SPREADSHEET_ID
     )
-    return {"ok": configured, "service": "daga-line-gemini", "model": GEMINI_MODEL}, (200 if configured else 503)
+    return {
+        "ok": configured,
+        "service": "daga-line-gemini",
+        "model": GEMINI_MODEL,
+        "knowledge_intake": "links-files-v1",
+        "knowledge_cloud_configured": bool(os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN") and os.getenv("GOOGLE_DRIVE_FOLDER_ID")),
+    }, (200 if configured else 503)
 
 
 @app.get("/voice")
@@ -662,6 +668,7 @@ def send_voice_reply(user_id, text):
 def process_message(
     user_id, user_text=None, image_b64=None, audio_b64=None,
     audio_mime_type="audio/m4a", line_message_id="",
+    file_data=None, filename="attachment.bin", file_mime_type=None,
 ):
     try:
         try:
@@ -680,28 +687,31 @@ def process_message(
                 append_liveboard_memory(user_id, user_text, user_profile, line_message_id)
             except Exception:
                 app.logger.exception("Liveboard Memory append failed; conversation will continue")
+        elif file_data is not None:
+            history.append({"role": "user", "content": "[檔案] " + filename})
         elif image_b64:
             history.append({"role": "user", "content": "[圖片]"})
         elif audio_b64:
             # Keep a marker in conversation context; do not persist a voice transcript.
             history.append({"role": "user", "content": "[語音訊息]"})
-        video_urls = extract_video_urls(user_text or "") if not (image_b64 or audio_b64) else []
-        if video_urls:
-            # A new video must be analyzed even if an older memory matches its topic.
-            video_results = []
-            for video_url in video_urls:
+        resource_urls = extract_urls(user_text or "") if not (image_b64 or audio_b64) else []
+        if resource_urls or file_data is not None:
+            # New user-shared materials are analyzed independently of old retrieval hits.
+            intake_results = []
+            sources = resource_urls if file_data is None else ["LINE附件：" + filename]
+            for source in sources:
                 try:
-                    result = ingest_video(video_url, user_id, user_text or "", entry="LINE", event_id=line_message_id)
-                    video_results.append(result["answer"])
+                    result = ingest_resource(source, user_id, user_text or "", entry="LINE", event_id=line_message_id, data=file_data, filename=filename, mime_type=file_mime_type)
+                    intake_results.append(result["answer"])
                 except Exception:
-                    app.logger.exception("Video knowledge workflow failed")
-                    video_results.append("影片流程未能完成雲端保存；請檢查大G知識庫權限與設定後重傳連結。")
-            answer = "\n\n".join(video_results)
+                    app.logger.exception("Knowledge intake failed")
+                    intake_results.append("這份素材未能完成讀取或保存，請稍後重傳；目前不能確認已存入知識庫。")
+            answer = "\n\n".join(intake_results)
             history.append({"role": "assistant", "content": answer})
             try:
                 save_user_context(user_id, history, user_profile)
             except Exception:
-                app.logger.exception("Video reply history save failed")
+                app.logger.exception("Knowledge reply history save failed")
             send_text(user_id, answer)
             return
         knowledge_text = ""
@@ -851,12 +861,39 @@ def handle_image(event):
             )
         )
         content = MessagingApiBlob(api_client).get_message_content(event.message.id)
-    image_b64 = base64.b64encode(content).decode("ascii")
     threading.Thread(
         target=process_message,
-        args=(event.source.user_id, None, image_b64),
+        args=(event.source.user_id,),
+        kwargs={"file_data": content, "filename": "image.jpg", "file_mime_type": "image/jpeg", "line_message_id": event.message.id},
         daemon=True,
     ).start()
+
+
+def process_file_attachment(user_id, message_id, filename, mime_type=None):
+    try:
+        with ApiClient(configuration) as api_client:
+            data = MessagingApiBlob(api_client).get_message_content(message_id)
+        if not 0 < len(data) <= MAX_KNOWLEDGE_BYTES:
+            send_text(user_id, "檔案為空或超過12MB，目前尚未分析或保存；請提供較小的檔案。")
+            return
+        process_message(user_id, file_data=bytes(data), filename=filename, file_mime_type=mime_type, line_message_id=message_id)
+    except Exception:
+        app.logger.exception("Could not retrieve knowledge attachment")
+        send_text(user_id, "目前無法取得這份檔案，尚未保存；請稍後重傳。")
+
+
+@handler.add(MessageEvent, message=FileMessageContent)
+@handler.add(MessageEvent, message=VideoMessageContent)
+def handle_knowledge_attachment(event):
+    is_video = isinstance(event.message, VideoMessageContent)
+    too_large = (getattr(event.message, "file_size", 0) or 0) > MAX_KNOWLEDGE_BYTES
+    too_long = (getattr(event.message, "duration", 0) or 0) > 15 * 60 * 1000
+    text = "檔案超過目前12MB或影片15分鐘的處理範圍，尚未保存。" if too_large or too_long else "收到，我會讀取內容、整理分類，並回報知識庫保存狀態。"
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=startup_ack(text))]))
+    if too_large or too_long:
+        return
+    threading.Thread(target=process_file_attachment, args=(event.source.user_id, event.message.id, "video.mp4" if is_video else event.message.file_name, "video/mp4" if is_video else None), daemon=True).start()
 
 
 def process_audio_message(user_id, message_id):
