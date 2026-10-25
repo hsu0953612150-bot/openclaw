@@ -63,6 +63,19 @@ _audio_lock = threading.Lock()
 _audio_cache = {}
 _live_token_lock = threading.Lock()
 _live_token_requests = []
+_startup_greeting_lock = threading.Lock()
+_startup_greeting_sent = False
+
+
+def startup_ack(default_message):
+    """Greet on the first LINE event handled after each service start."""
+    global _startup_greeting_sent
+    with _startup_greeting_lock:
+        if not _startup_greeting_sent:
+            _startup_greeting_sent = True
+            app.logger.info("Sending startup greeting for first LINE event")
+            return "您好，我是大G，已經開始服務，正在處理您的訊息。"
+    return default_message
 
 
 @app.get("/")
@@ -782,7 +795,7 @@ def handle_text(event):
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="🤖 收到，我正在整理回覆。")],
+                messages=[TextMessage(text=startup_ack("🤖 收到，我正在整理回覆。"))],
             )
         )
     threading.Thread(
@@ -801,7 +814,7 @@ def handle_image(event):
         line_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="🤖 收到圖片，我正在查看。")],
+                messages=[TextMessage(text=startup_ack("🤖 收到圖片，我正在查看。"))],
             )
         )
         content = MessagingApiBlob(api_client).get_message_content(event.message.id)
@@ -834,7 +847,7 @@ def handle_audio(event):
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="🎧 收到語音，我正在聆聽並整理回覆。")],
+                messages=[TextMessage(text=startup_ack("🎧 收到語音，我正在聆聽並整理回覆。"))],
             )
         )
     threading.Thread(
