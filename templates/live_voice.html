@@ -49,6 +49,8 @@
     let peerConnection;
     let dataChannel;
     let remoteAudio;
+    let activeProvider = '';
+    let openAIFallbackAttempted = false;
     let audioContext;
     let mediaStream;
     let processor;
@@ -262,6 +264,29 @@
       await peerConnection.setRemoteDescription({ type: 'answer', sdp: await response.text() });
     }
 
+    async function switchToOpenAIRealtime() {
+      if (!live || openAIFallbackAttempted) return;
+      openAIFallbackAttempted = true;
+      activeProvider = 'openai';
+      setStatus('Gemini 即時連線沒有成功，正在切換至 OpenAI Realtime…');
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+      socket = null;
+      try {
+        const response = await fetch('/api/live-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ force_openai: true }),
+          cache: 'no-store',
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || '無法啟用 OpenAI 即時語音備援。');
+        await startOpenAIRealtime(result.token, result.model);
+      } catch (error) {
+        setStatus(error.message || 'OpenAI 即時語音備援連線失敗。', true);
+        stopSession();
+      }
+    }
+
     async function startSession() {
       startButton.disabled = true;
       setStatus('正在連線…');
@@ -280,9 +305,11 @@
         outputGain = audioContext.createGain();
         outputGain.connect(audioContext.destination);
         live = true;
+        activeProvider = result.provider || 'gemini';
+        openAIFallbackAttempted = activeProvider === 'openai';
         startButton.style.display = 'none';
         stopButton.style.display = 'block';
-        if (result.provider === 'openai') {
+        if (activeProvider === 'openai') {
           await startOpenAIRealtime(result.token, result.model);
           return;
         }
@@ -306,11 +333,17 @@
           try { handleServerMessage(JSON.parse(event.data)); }
           catch (error) { console.error('Could not process Gemini Live message', error); }
         };
-        socket.onerror = () => setStatus('即時語音連線發生問題，請回聊天室重新取得連結。', true);
+        socket.onerror = () => {
+          if (activeProvider === 'gemini') switchToOpenAIRealtime();
+        };
         socket.onclose = (event) => {
+          if (activeProvider !== 'gemini') return;
           if (live) {
-            setStatus(event.code === 1000 ? '連線已結束。' : '連線中斷，請回聊天室重新取得連結。', event.code !== 1000);
-            stopSession();
+            if (event.code !== 1000) switchToOpenAIRealtime();
+            else {
+              setStatus('連線已結束。');
+              stopSession();
+            }
           }
         };
       } catch (error) {

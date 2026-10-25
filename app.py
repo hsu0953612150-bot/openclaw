@@ -123,6 +123,10 @@ def create_live_token():
             return {"error": "目前即時語音使用次數已達暫時上限，請稍後再試。"}, 429
         _live_token_requests.append(now)
 
+    request_data = request.get_json(silent=True) or {}
+    if request_data.get("force_openai") is True:
+        return _create_openai_live_fallback()
+
     if not GEMINI_API_KEY:
         return _create_openai_live_fallback()
 
