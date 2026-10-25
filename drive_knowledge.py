@@ -240,6 +240,8 @@ def retrieve_knowledge(query):
         return "知識庫資料夾目前沒有可讀取的文字文件。", []
 
     query_terms = _terms(query)
+    if not query_terms:
+        return "", []
     ranked = []
     for item in files:
         for chunk in item["chunks"]:
@@ -250,19 +252,23 @@ def retrieve_knowledge(query):
     for score, item, chunk in ranked:
         if item["id"] in seen:
             continue
-        if query_terms and score == 0:
+        # Require more than a single incidental token overlap before attaching
+        # a document; otherwise an unrelated old topic can steer the answer.
+        if query_terms and score < 2:
             continue
         selected.append((score, item, chunk))
         seen.add(item["id"])
         if len(selected) >= 4:
             break
     if not selected and query_terms:
-        scanned_pdfs = [item for item in files if item["is_pdf"] and not item["has_text"]]
+        scanned_pdfs = [
+            item for item in files
+            if item["is_pdf"] and not item["has_text"]
+            and _score(query_terms, item["name"], "") >= 3
+        ]
         if len(scanned_pdfs) == 1:
             item = scanned_pdfs[0]
             selected = [(1, item, "這份 PDF 沒有可擷取文字，將由 Gemini 直接辨識頁面內容。")]
-    if not selected and not query_terms:
-        selected = [(0, item, item["chunks"][0]) for item in files[:3] if item["chunks"]]
     if not selected:
         return "", []
 
