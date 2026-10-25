@@ -29,6 +29,8 @@ from linebot.v3.webhooks import AudioMessageContent, ImageMessageContent, Messag
 from oauth2client.service_account import ServiceAccountCredentials
 from drive_knowledge import retrieve_knowledge
 from video_knowledge import extract_video_urls, ingest as ingest_video, retrieve as retrieve_video_knowledge
+from gemini_errors import GeminiQuotaError, is_project_quota_exhausted, user_facing_reply
+from openai_fallback import OpenAIFallbackUnavailable, generate_text_fallback
 
 
 app = Flask(__name__)
@@ -522,6 +524,9 @@ def gemini_generate(
             raise RuntimeError(f"Gemini API request timed out for model {model}") from error
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:1000]
+            if is_project_quota_exhausted(error.code, detail):
+                app.logger.error("Gemini project quota exhausted for model %s (HTTP 429)", model)
+                raise GeminiQuotaError("Gemini project quota exhausted (HTTP 429)") from error
             if error.code in (429, 503) and model_index + 1 < len(models):
                 app.logger.warning(
                     "Gemini model %s returned HTTP %s; trying fallback model %s",
@@ -755,17 +760,38 @@ def process_message(
                 "Google Search fallback" if not has_relevant_knowledge else "internal results"
             ),
         )
-        answer = gemini_generate(
-            history,
-            image_b64=image_b64,
-            audio_b64=audio_b64,
-            audio_mime_type=audio_mime_type,
-            knowledge_text=knowledge_text if has_relevant_knowledge else "",
-            knowledge_pdfs=knowledge_pdfs if has_relevant_knowledge else [],
-            google_search=use_google_search,
-            youtube_url=youtube_url if not has_relevant_knowledge else "",
-            user_profile=user_profile,
-        )
+        try:
+            answer = gemini_generate(
+                history,
+                image_b64=image_b64,
+                audio_b64=audio_b64,
+                audio_mime_type=audio_mime_type,
+                knowledge_text=knowledge_text if has_relevant_knowledge else "",
+                knowledge_pdfs=knowledge_pdfs if has_relevant_knowledge else [],
+                google_search=use_google_search,
+                youtube_url=youtube_url if not has_relevant_knowledge else "",
+                user_profile=user_profile,
+            )
+        except GeminiQuotaError:
+            if image_b64 or audio_b64:
+                raise OpenAIFallbackUnavailable(
+                    "Media is excluded from the text-only OpenAI fallback"
+                )
+            fallback_instructions = (
+                SYSTEM_INSTRUCTION
+                + "\n\n目前是 Gemini 額度耗盡時的 GPT 備援；你會收到近期文字對話，"
+                "以及本次檢索到的相關大G記憶與知識庫資料。沒有提供網路搜尋結果時，"
+                "不可聲稱已即時搜尋；若答案需要未提供的資料，請坦白說目前無法取得。"
+            )
+            app.logger.warning("Gemini quota exhausted; using OpenAI text-only fallback")
+            answer = generate_text_fallback(
+                history,
+                fallback_instructions,
+                knowledge_text=knowledge_text if has_relevant_knowledge else "",
+                knowledge_pdfs=knowledge_pdfs if has_relevant_knowledge else [],
+                user_profile=user_profile,
+            )
+            app.logger.info("OpenAI fallback succeeded")
         history.append({"role": "assistant", "content": answer})
         try:
             save_user_context(user_id, history, user_profile)
@@ -783,7 +809,14 @@ def process_message(
     except Exception as error:
         app.logger.exception("LINE/Gemini message processing failed")
         try:
-            send_text(user_id, "我目前暫時無法完成這則訊息，請稍後再試。系統已記錄錯誤供檢查。")
+            if isinstance(error, OpenAIFallbackUnavailable):
+                send_text(
+                    user_id,
+                    "Gemini 的 AI Studio 額度已用盡，GPT 備援目前無法完成這則訊息。"
+                    "若是圖片或語音，請改用文字描述；若是文字訊息，請管理者確認 OpenAI API 備援設定。",
+                )
+            else:
+                send_text(user_id, user_facing_reply(error))
         except Exception:
             app.logger.exception("Could not send LINE error reply")
 
