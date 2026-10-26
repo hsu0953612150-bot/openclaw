@@ -41,6 +41,9 @@ from openai_fallback import (
 )
 
 
+from codex_line_bridge import route_text as route_codex_text
+
+
 app = Flask(__name__)
 configuration = Configuration(access_token=os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("LINE_CHANNEL_SECRET"))
@@ -108,6 +111,7 @@ def health():
         "service": "daga-line-gemini",
         "model": GEMINI_MODEL,
         "knowledge_intake": "links-files-v2",
+        "codex_bridge": "owner-paired-sheets-v1",
         "knowledge_cloud_configured": bool(os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN") and os.getenv("GOOGLE_DRIVE_FOLDER_ID")),
     }, (200 if configured else 503)
 
@@ -915,11 +919,23 @@ def handle_text(event):
             )
         )
     threading.Thread(
-        target=process_message,
+        target=process_text_route,
         args=(event.source.user_id, event.message.text, None),
-        kwargs={"line_message_id": event.message.id},
+        kwargs={"line_message_id": event.message.id, "source_type": getattr(event.source, "type", "")},
         daemon=True,
     ).start()
+
+
+def process_text_route(user_id, user_text, _image=None, line_message_id="", source_type="user"):
+    try:
+        response = route_codex_text(user_id, user_text, line_message_id, source_type)
+        if response is not None:
+            send_text(user_id, response)
+            return
+        process_message(user_id, user_text, line_message_id=line_message_id)
+    except Exception:
+        app.logger.exception("Could not persist or route the Codex task")
+        send_text(user_id, "目前無法確認電腦任務是否已入列；請先傳「電腦狀態」查詢，避免重複操作。")
 
 
 @handler.add(MessageEvent, message=ImageMessageContent)
