@@ -41,7 +41,7 @@ from openai_fallback import (
 )
 
 
-from codex_line_bridge import route_text as route_codex_text
+from codex_line_bridge import deliver_notification, route_text as route_codex_text, verify_notification
 
 
 app = Flask(__name__)
@@ -119,6 +119,20 @@ def health():
 @app.get("/voice")
 def live_voice_page():
     return render_template("live_voice.html")
+
+
+@app.post("/api/codex/deliver")
+def deliver_codex_result():
+    try:
+        payload = verify_notification(os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN", ""), request.get_data(), request.headers.get("X-Daga-Codex-Signature", ""))
+        return deliver_notification(payload, os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")), 200
+    except PermissionError:
+        return {"error": "通知驗證失敗或尚未綁定"}, 403
+    except (ValueError, TypeError):
+        return {"error": "通知格式無效"}, 400
+    except Exception:
+        app.logger.exception("Codex result notification failed")
+        return {"error": "結果尚未送達LINE，會由本機佇列重試"}, 503
 
 
 @app.post("/api/live-token")

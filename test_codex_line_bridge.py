@@ -1,6 +1,8 @@
 import hashlib
+import json
 import time
 import unittest
+from unittest.mock import patch
 
 import codex_line_bridge as bridge
 
@@ -29,8 +31,44 @@ class MemoryStore:
     def question_update(self, index, row):
         self.prompts[index - 2] = list(row)
 
+    def task_update(self, index, row):
+        self.rows[index - 2] = list(row)
+
 
 class LineBridgeTests(unittest.TestCase):
+    def test_notification_requires_signature_and_recent_timestamp(self):
+        body = json.dumps({"kind": "probe", "timestamp": time.time()}).encode()
+        signature = bridge.notification_signature("example-secret", body)
+        self.assertEqual(bridge.verify_notification("example-secret", body, signature)["kind"], "probe")
+        for secret, payload, supplied in (("", body, signature), ("different", body, signature), ("example-secret", body + b" ", signature)):
+            with self.assertRaises(PermissionError):
+                bridge.verify_notification(secret, payload, supplied)
+        expired = json.dumps({"kind": "probe", "timestamp": time.time() - 301}).encode()
+        with self.assertRaises(PermissionError):
+            bridge.verify_notification("example-secret", expired, bridge.notification_signature("example-secret", expired))
+
+    @patch.object(bridge, "line_api")
+    def test_delivery_uses_stored_owner_and_result_not_caller_values(self, api):
+        store = MemoryStore()
+        store.rows = [["job", "0", "owner", "msg", "指令", "completed", "真正結果", "thread", "0", ""]]
+        bridge.deliver_notification({"kind": "result", "id": "job", "to": "stranger", "text": "偽造內容"}, "example-token", store)
+        sent = api.call_args.args[2]
+        self.assertEqual(sent["to"], "owner")
+        self.assertIn("真正結果", sent["messages"][0]["text"])
+        self.assertNotIn("偽造內容", str(sent))
+        self.assertTrue(store.rows[0][9])
+        bridge.deliver_notification({"kind": "result", "id": "job"}, "example-token", store)
+        api.assert_called_once()
+
+    @patch.object(bridge, "line_api")
+    def test_delivery_rejects_unpaired_unfinished_or_wrong_owner_jobs(self, api):
+        for owner, task_owner, state in (("", "owner", "completed"), ("owner", "stranger", "completed"), ("owner", "owner", "queued")):
+            store = MemoryStore(owner)
+            store.rows = [["job", "0", task_owner, "msg", "指令", state, "結果", "", "0", ""]]
+            with self.assertRaises((PermissionError, ValueError)):
+                bridge.deliver_notification({"kind": "result", "id": "job"}, "example-token", store)
+        api.assert_not_called()
+
     def test_all_owner_text_is_queued_without_prefix(self):
         store = MemoryStore()
         result = bridge.route_text("owner", "幫我整理工作區", "message-1", store=store)

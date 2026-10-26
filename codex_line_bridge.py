@@ -6,6 +6,9 @@ import re
 import threading
 import time
 import urllib.parse
+import urllib.error
+import urllib.request
+import uuid
 
 from video_knowledge import Cloud
 
@@ -16,6 +19,71 @@ CONTROL_KEYS = ("owner_id", "pairing_sha256", "pairing_expires", "worker_heartbe
 TASK_HEADERS = ["任務ID", "建立時間", "使用者ID", "訊息ID", "指令", "狀態", "結果", "Codex對話ID", "更新時間", "已回覆"]
 QUESTION_HEADERS = ["確認碼", "任務ID", "使用者ID", "說明", "狀態", "回答", "建立時間", "類型"]
 _lock = threading.RLock()
+
+
+def notification_signature(secret, body):
+    key = hmac.new(secret.encode(), b"daga-codex-delivery-v1", hashlib.sha256).digest()
+    return hmac.new(key, body, hashlib.sha256).hexdigest()
+
+
+def verify_notification(secret, body, signature):
+    if not secret or len(body) > 1024 or not hmac.compare_digest(notification_signature(secret, body), signature):
+        raise PermissionError("通知驗證失敗")
+    data = json.loads(body)
+    if abs(time.time() - float(data.get("timestamp", 0))) > 300:
+        raise PermissionError("通知已逾時")
+    if data.get("kind") not in ("result", "question", "probe"):
+        raise ValueError("通知類型無效")
+    return data
+
+
+def line_api(path, token, body=None, delivery_id=""):
+    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+    if delivery_id:
+        headers["X-Line-Retry-Key"] = str(uuid.uuid5(uuid.NAMESPACE_URL, "daga-codex:" + delivery_id))
+    request = urllib.request.Request("https://api.line.me/v2/bot/" + path, data=json.dumps(body, ensure_ascii=False).encode() if body is not None else None, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read()
+        return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as error:
+        if error.code == 409 and delivery_id:
+            return {}
+        raise
+
+
+def deliver_notification(data, token, store=None):
+    """Signed notifications deliver only a stored owner's result, never caller text."""
+    store = store or BridgeStore()
+    config = store.control()
+    if data["kind"] == "probe":
+        info = line_api("info", token)
+        return {"ok": True, "paired": bool(config.get("owner_id")), "line_bot_name": info.get("displayName")}
+    owner = config.get("owner_id", "")
+    if not owner or config.get("enabled") != "true":
+        raise PermissionError("電腦尚未完成本人綁定")
+    with _lock:
+        if data["kind"] == "result":
+            match = next(((index, row) for index, row in store.tasks() if row[0] == data.get("id") and row[2] == owner), None)
+            if not match or match[1][5] not in ("completed", "failed"):
+                raise ValueError("找不到已完成的本人任務")
+            index, row = match
+            if row[9]:
+                return {"ok": True, "already_delivered": True}
+            text = row[6] + "\n\n任務：" + row[0]
+        else:
+            match = next(((index, row) for index, row in store.questions() if row[0] == data.get("id") and row[2] == owner and row[4] == "pending"), None)
+            if not match or time.time() - float(match[1][6]) > 1800:
+                raise ValueError("找不到有效的本人確認")
+            row = match[1]
+            instruction = f"回答 {row[0]} 你的答案" if row[7] == "question" else f"確認 {row[0]}」或「拒絕 {row[0]}"
+            text = f"Codex需要你的{'回答' if row[7] == 'question' else '確認'}：\n{row[3]}\n\n請回覆「{instruction}」。30分鐘內未回答就不授權。"
+        chunks = [text[i:i + 4000] for i in range(0, min(len(text), 20000), 4000)] or ["已完成，沒有文字輸出。"]
+        line_api("message/push", token, {"to": owner, "messages": [{"type": "text", "text": part} for part in chunks]}, data["kind"] + ":" + data["id"])
+        if data["kind"] == "result":
+            row[9] = timestamp()
+            store.task_update(index, row)
+        return {"ok": True}
 
 
 def timestamp():
