@@ -39,6 +39,14 @@ URL = "https://www.youtube.com/watch?v=ebFYTlePxx4"
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_saves_source_backed_research_as_knowledge_card(self):
+        cloud = FakeCloud()
+        self.assertTrue(workflow.save_research_record("user-1", "測試問題", "研究摘要",
+            [{"url": "https://example.com/source", "title": "可靠來源"}], cloud=cloud))
+        record = cloud.saved[0]
+        self.assertEqual(record["resource_type"], "web_research")
+        self.assertEqual(record["source_url"], "https://example.com/source")
+
     def test_public_sd_stream_with_unknown_codecs_is_selected(self):
         from yt_dlp import YoutubeDL
         info = {"id": "public-video", "title": "Public video", "formats": [

@@ -322,6 +322,30 @@ def record_answer(record):
     return f"{a['title']}\n\n{a['summary']}\n\n知識點：\n{points}"
 
 
+
+def save_research_record(user_id, query, answer, citations, cloud=None):
+    """Save source-backed GPT research in the existing 大G Drive knowledge folder."""
+    sources = [{"title": str(c.get("title", ""))[:300], "url": c.get("url", "")}
+               for c in (citations or []) if isinstance(c, dict) and
+               isinstance(c.get("url"), str) and c["url"].startswith("https://")][:8]
+    if not sources or not str(answer).strip(): return False
+    cloud = cloud or Cloud()
+    cloud.check()
+    owner = os.getenv("VIDEO_KNOWLEDGE_OWNER_ID", "").strip() or user_id
+    record_id = hashlib.sha256((owner + "\nweb-research\n" + query + "\n" + "\n".join(s["url"] for s in sources)).encode()).hexdigest()[:32]
+    with _lock:
+        record = cloud.find_record(record_id) or {"record_id": record_id, "owner_id": owner,
+            "resource_type": "web_research", "source_url": sources[0]["url"], "created_at": now()}
+        record.update(status="已完成", updated_at=now(), error="", analysis={
+            "title": (query.strip()[:180] or "網路研究") + "（來源整理）",
+            "evidence_basis": "OpenAI 網路搜尋來源", "summary": str(answer).strip()[:2000],
+            "knowledge_points": ["來源：" + s["title"] + " — " + s["url"] for s in sources],
+            "steps": [], "tools": [], "tags": ["網路研究", "LINE語音備援"],
+            "evidence": [], "inferences": [], "uncertainties": []})
+        cloud.save(record)
+    return True
+
+
 def ingest(url, user_id, message="", entry="Codex", event_id="", cloud=None):
     cloud = cloud or Cloud()
     cloud.check()  # No analysis charges or cloud writes before destinations are verified.
@@ -401,7 +425,7 @@ def retrieve(user_id, query, limit=3, cloud=None):
         if score:
             ranked.append((score, record))
     ranked.sort(key=lambda pair: pair[0], reverse=True)
-    return "\n\n".join(record_answer(r) + "\n影片來源：" + r["source_url"] for _, r in ranked[:limit])[:12000]
+    return "\n\n".join(record_answer(r) + ("\n研究來源：" if r.get("resource_type") == "web_research" else "\n影片來源：") + r["source_url"] for _, r in ranked[:limit])[:12000]
 
 
 def main():

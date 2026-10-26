@@ -6,6 +6,7 @@ from openai_fallback import (
     OPENAI_API_URL,
     OpenAIFallbackUnavailable,
     generate_text_fallback,
+    transcribe_audio_fallback,
 )
 
 
@@ -24,6 +25,39 @@ class FakeResponse:
 
 
 class OpenAIFallbackTests(unittest.TestCase):
+    @patch("openai_fallback.urllib.request.urlopen")
+    def test_transcribes_line_audio_with_gpt_transcribe_and_traditional_chinese_hint(self, urlopen):
+        urlopen.return_value = FakeResponse({"text": "請幫我整理資料"})
+        transcript = transcribe_audio_fallback("YXVkaW8=", "audio/m4a", api_key="test-key")
+        self.assertEqual(transcript, "請幫我整理資料")
+        request = urlopen.call_args.args[0]
+        self.assertIn("/audio/transcriptions", request.full_url)
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+        self.assertIn(b'name="model"\r\n\r\ngpt-transcribe', request.data)
+        self.assertIn(b'name="languages[]"\r\n\r\nzh-tw', request.data)
+        self.assertIn(b'filename="voice.m4a"', request.data)
+        self.assertIn(b'audio', request.data)
+
+    def test_rejects_unsupported_audio_without_api_call(self):
+        with self.assertRaises(OpenAIFallbackUnavailable):
+            transcribe_audio_fallback("YXVkaW8=", "application/octet-stream", api_key="test-key")
+
+    @patch("openai_fallback.urllib.request.urlopen")
+    def test_web_search_returns_source_citations(self, urlopen):
+        urlopen.return_value = FakeResponse({"output": [{"type": "message", "content": [{
+            "type": "output_text", "text": "研究答案", "annotations": [{
+                "type": "url_citation", "url_citation": {"url": "https://example.com/source", "title": "來源"},
+            }],
+        }]}]})
+        result = generate_text_fallback(
+            [{"role": "user", "content": "近期問題"}], "rules", api_key="test-key",
+            use_web_search=True, return_metadata=True,
+        )
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["tools"], [{"type": "web_search"}])
+        self.assertEqual(result["answer"], "研究答案")
+        self.assertEqual(result["citations"][0]["url"], "https://example.com/source")
+
     @patch("openai_fallback.urllib.request.urlopen")
     def test_sends_only_recent_plain_text_dialogue(self, urlopen):
         urlopen.return_value = FakeResponse({
@@ -61,6 +95,7 @@ class OpenAIFallbackTests(unittest.TestCase):
         ])
         self.assertFalse(payload["store"])
         self.assertEqual(payload["instructions"], "system instruction")
+        # A multi-turn request containing assistant input_text is rejected (HTTP 400).
         self.assertEqual(payload["input"][-2]["role"], "assistant")
         self.assertEqual(payload["input"][-2]["content"][0]["type"], "output_text")
         self.assertEqual(payload["input"][-1]["content"][0]["type"], "input_text")
