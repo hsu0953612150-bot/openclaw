@@ -99,7 +99,8 @@ def generate_text_fallback(
             continue
         input_messages.append({
             "role": role,
-            "content": [{"type": "input_text", "text": content}],
+            # Responses treats prior assistant replies as output content.
+            "content": [{"type": "output_text" if role == "assistant" else "input_text", "text": content}],
         })
     if not input_messages:
         raise OpenAIFallbackUnavailable("No text dialogue is available for fallback")
@@ -119,9 +120,11 @@ def generate_text_fallback(
         file_data = document.get("data")
         if not current_user_message or not file_data:
             break
+        if not file_data.startswith("data:"):
+            file_data = "data:application/pdf;base64," + file_data
         current_user_message["content"].append({
             "type": "input_file",
-            "filename": document.get("filename") or "大G知識庫.pdf",
+            "filename": document.get("filename") or document.get("name") or "大G知識庫.pdf",
             "file_data": file_data,
         })
 

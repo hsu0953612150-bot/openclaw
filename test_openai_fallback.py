@@ -1,4 +1,3 @@
->>
 import json
 import unittest
 from unittest.mock import patch
@@ -62,6 +61,9 @@ class OpenAIFallbackTests(unittest.TestCase):
         ])
         self.assertFalse(payload["store"])
         self.assertEqual(payload["instructions"], "system instruction")
+        self.assertEqual(payload["input"][-2]["role"], "assistant")
+        self.assertEqual(payload["input"][-2]["content"][0]["type"], "output_text")
+        self.assertEqual(payload["input"][-1]["content"][0]["type"], "input_text")
 
     def test_requires_openai_api_key(self):
         with patch.dict("os.environ", {}, clear=True):
@@ -105,6 +107,7 @@ class OpenAIFallbackTests(unittest.TestCase):
         self.assertIn("本次檢索到的相關記錄", content[1]["text"])
         self.assertEqual(content[2]["type"], "input_file")
         self.assertEqual(content[2]["filename"], "reference.pdf")
+        self.assertEqual(content[2]["file_data"], "data:application/pdf;base64,cGRmLWJhc2U2NA==")
 
 
 if __name__ == "__main__":
