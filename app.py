@@ -42,6 +42,7 @@ from openai_fallback import (
 
 
 from codex_line_bridge import deliver_notification, route_text as route_codex_text, verify_notification
+from line_voice_bridge import route_audio_to_codex
 
 
 app = Flask(__name__)
@@ -112,6 +113,7 @@ def health():
         "model": GEMINI_MODEL,
         "knowledge_intake": "links-files-v2",
         "codex_bridge": "owner-paired-sheets-v1",
+        "codex_voice_bridge": "transcribe-to-codex-v1",
         "knowledge_cloud_configured": bool(os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN") and os.getenv("GOOGLE_DRIVE_FOLDER_ID")),
     }, (200 if configured else 503)
 
@@ -999,16 +1001,24 @@ def handle_knowledge_attachment(event):
     threading.Thread(target=process_file_attachment, args=(event.source.user_id, event.message.id, "video.mp4" if is_video else event.message.file_name, "video/mp4" if is_video else None), daemon=True).start()
 
 
-def process_audio_message(user_id, message_id):
+def process_audio_message(user_id, message_id, source_type="user", duration_ms=0):
     try:
-        with ApiClient(configuration) as api_client:
-            audio_content = MessagingApiBlob(api_client).get_message_content(message_id)
+        def load_audio():
+            with ApiClient(configuration) as api_client:
+                return bytes(MessagingApiBlob(api_client).get_message_content(message_id))
+
+        routed = route_audio_to_codex(user_id, message_id, load_audio, source_type, duration_ms)
+        if routed is not None:
+            send_text(user_id, routed)
+            app.logger.info("Paired owner LINE audio routed to the local Codex queue")
+            return
+        audio_content = load_audio()
         audio_b64 = base64.b64encode(audio_content).decode("ascii")
-        process_message(user_id, audio_b64=audio_b64, audio_mime_type="audio/m4a")
+        process_message(user_id, audio_b64=audio_b64, audio_mime_type="audio/m4a", line_message_id=message_id)
     except Exception:
         app.logger.exception("Could not retrieve or process LINE audio message")
         try:
-            send_text(user_id, "我目前無法讀取這段語音，請稍後再傳一次，或改用文字訊息。")
+            send_text(user_id, "這段語音目前未完成轉錄或入列，尚未確認電腦執行；請稍後重傳，或改用文字訊息。")
         except Exception:
             app.logger.exception("Could not send LINE audio error reply")
 
@@ -1026,6 +1036,7 @@ def handle_audio(event):
     threading.Thread(
         target=process_audio_message,
         args=(event.source.user_id, event.message.id),
+        kwargs={"source_type": getattr(event.source, "type", ""), "duration_ms": getattr(event.message, "duration", 0) or 0},
         daemon=True,
     ).start()
 
