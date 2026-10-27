@@ -44,29 +44,36 @@ class PlaybackTests(unittest.TestCase):
         with self.assertRaises(LookupError):
             PlaybackStore(sheet).load(token)
 
-    def test_tts_failure_keeps_per_answer_button_and_all_text(self):
+    def test_tts_failure_keeps_text_and_reports_failure_without_web_card(self):
         text = "完整回答🙂" * 4000
         messages = final_messages(text, "https://example.com", PlaybackStore(FakePlaybackSheet()), Mock(side_effect=RuntimeError("quota")))
-        self.assertEqual("".join(m["text"] for m in messages if m["type"] == "text"), text)
-        self.assertEqual(messages[-1]["type"], "flex")
-        uri = messages[-1]["contents"]["body"]["contents"][0]["action"]["uri"]
-        self.assertLess(len(uri), 1000)
-        self.assertTrue(uri.startswith("https://example.com/listen/"))
+        self.assertEqual("".join(m["text"] for m in messages[:-1]), text)
+        self.assertIn("語音暫時無法產生", messages[-1]["text"])
+        self.assertTrue(all(m["type"] == "text" for m in messages))
+
+    def test_native_audio_has_duration_and_no_web_or_sheet_dependency(self):
+        store = Mock(side_effect=RuntimeError("must not access Sheets"))
+        audio = {"type": "audio", "originalContentUrl": "https://example.com/audio/test.mp3", "duration": 37000}
+        messages = final_messages("這是回答", "https://example.com", store, Mock(return_value=audio))
+        self.assertEqual([m["type"] for m in messages], ["text", "audio"])
+        self.assertEqual(messages[-1], audio)
+        self.assertIn("AI合成語音", messages[0]["text"])
+        store.save.assert_not_called()
 
     @patch("codex_line_bridge.line_api")
     def test_long_codex_result_preserves_all_text_batches_and_retry_ids(self, api):
         store = MemoryStore()
         text = "長回答" * 8000
         store.rows.append(["job", "", "owner", "", "", "completed", text, "", "", ""])
-        callback = lambda value: final_messages(value, "https://example.com", PlaybackStore(FakePlaybackSheet()))
+        callback = lambda value: final_messages(value, "https://example.com", audio_message=lambda _: {"type": "audio", "originalContentUrl": "https://example.com/audio/test.mp3", "duration": 37000})
         deliver_notification({"kind": "result", "id": "job"}, "test", store, reply_messages=callback)
         calls = api.call_args_list
         self.assertGreater(len(calls), 1)
         self.assertTrue(all(len(c.args[2]["messages"]) <= 5 for c in calls))
         self.assertEqual(len(set(c.args[3] for c in calls)), len(calls))
         sent = [m for c in calls for m in c.args[2]["messages"]]
-        self.assertEqual("".join(m["text"] for m in sent if m["type"] == "text"), text + "\n\n任務：job")
-        self.assertEqual(sent[-1]["type"], "flex")
+        self.assertEqual("".join(m["text"] for m in sent if m["type"] == "text"), text + "\n\n任務：job\n\n（附AI合成語音）")
+        self.assertEqual(sent[-1]["type"], "audio")
         self.assertTrue(store.rows[0][9])
 
     def test_encrypted_speech_fits_sheet_cell_limit(self):

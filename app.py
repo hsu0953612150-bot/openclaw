@@ -45,6 +45,7 @@ from codex_line_bridge import deliver_notification, line_api, route_text as rout
 from line_voice_bridge import route_audio_to_codex
 from message_routing import route_classified_text
 from reply_playback import PlaybackStore, final_messages
+from native_speech import synthesize_native
 
 
 app = Flask(__name__)
@@ -118,7 +119,7 @@ def health():
         "codex_bridge": "owner-paired-sheets-v1",
         "codex_voice_bridge": "transcribe-to-codex-v1",
         "message_routing": "computer-intent-v2",
-        "reply_playback": "per-answer-v1",
+        "reply_playback": "line-native-audio-v2",
         "knowledge_cloud_configured": bool(os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN") and os.getenv("GOOGLE_DRIVE_FOLDER_ID")),
     }, (200 if configured else 503)
 
@@ -644,7 +645,7 @@ def send_text(user_id, text):
 def synthesize_reply_audio(text):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured on the service")
-    speak_text = text[:1200]
+    speak_text = text
     body = json.dumps({
         "model": os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts"),
         "input": [{
@@ -668,7 +669,7 @@ def synthesize_reply_audio(text):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=20) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")[:500]
@@ -702,15 +703,7 @@ def synthesize_reply_audio(text):
 
 
 def build_reply_audio_message(text):
-    global _tts_retry_after
-    if time.time() < _tts_retry_after:
-        raise RuntimeError("Speech synthesis temporarily unavailable; use playback button")
-    try:
-        audio_mp3, duration_ms = synthesize_reply_audio(text)
-    except Exception:
-        _tts_retry_after = time.time() + 300
-        app.logger.warning("Speech synthesis failed; keeping per-answer playback button")
-        raise
+    audio_mp3, duration_ms = synthesize_native(text, synthesize_reply_audio)
     token = secrets.token_urlsafe(24)
     expires_at = time.time() + AUDIO_URL_TTL_SECONDS
     with _audio_lock:
@@ -730,7 +723,7 @@ def send_voice_reply(user_id, text):
     delivery = "reply:" + secrets.token_hex(16)
     for index in range(0, len(messages), 5):
         line_api("message/push", os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""), {"to": user_id, "messages": messages[index:index+5]}, delivery + ":" + str(index // 5))
-    app.logger.info("LINE final reply with playback button sent successfully")
+    app.logger.info("LINE final reply with native audio sent successfully")
 
 
 def process_message(
@@ -1063,5 +1056,6 @@ if __name__ == "__main__":
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 1000)))
+
 
 

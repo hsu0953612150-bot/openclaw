@@ -69,10 +69,13 @@ def playback_card(text, base_url, store=None):
 def final_messages(text, base_url, store=None, audio_message=None):
     # 2,000 Unicode characters stay below LINE's UTF-16 length limit, including emoji.
     messages = [{"type": "text", "text": text[i:i+2000]} for i in range(0, len(text), 2000)] or [{"type": "text", "text": "已完成，沒有文字輸出。"}]
-    messages.append(playback_card(text, base_url, store))
+    # New replies use LINE's native player, not a webpage or a Flex card.
     if audio_message:
         try:
-            messages.append(audio_message(text))
+            audio = audio_message(text)
         except Exception:
-            pass  # The durable button remains available even when synthesis fails.
+            messages.append({"type": "text", "text": "這次語音暫時無法產生，先提供文字；請稍後請我重試語音。"})
+        else:
+            messages[-1]["text"] += "\n\n（附AI合成語音）"
+            messages.append(audio)
     return messages

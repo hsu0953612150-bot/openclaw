@@ -19,6 +19,7 @@ CONTROL_KEYS = ("owner_id", "pairing_sha256", "pairing_expires", "worker_heartbe
 TASK_HEADERS = ["任務ID", "建立時間", "使用者ID", "訊息ID", "指令", "狀態", "結果", "Codex對話ID", "更新時間", "已回覆"]
 QUESTION_HEADERS = ["確認碼", "任務ID", "使用者ID", "說明", "狀態", "回答", "建立時間", "類型"]
 _lock = threading.RLock()
+_last_audio_delivery = {}
 
 
 def notification_signature(secret, body):
@@ -58,7 +59,7 @@ def deliver_notification(data, token, store=None, audio_message=None, reply_mess
     config = store.control()
     if data["kind"] == "probe":
         info = line_api("info", token)
-        return {"ok": True, "paired": bool(config.get("owner_id")), "line_bot_name": info.get("displayName")}
+        return {"ok": True, "paired": bool(config.get("owner_id")), "line_bot_name": info.get("displayName"), "audio_delivery": dict(_last_audio_delivery)}
     owner = config.get("owner_id", "")
     if not owner or config.get("enabled") != "true":
         raise PermissionError("電腦尚未完成本人綁定")
@@ -92,6 +93,7 @@ def deliver_notification(data, token, store=None, audio_message=None, reply_mess
             delivery_id = data["kind"] + ":" + data["id"] + (":" + str(offset // 5) if offset else "")
             line_api("message/push", token, {"to": owner, "messages": messages[offset:offset+5]}, delivery_id)
         if data["kind"] == "result":
+            _last_audio_delivery.update({"job_id": row[0], "native_audio_count": sum(m.get("type") == "audio" for m in messages), "web_card_count": sum(m.get("type") == "flex" for m in messages), "audio_duration_ms": sum(m.get("duration", 0) for m in messages if m.get("type") == "audio")})
             row[9] = timestamp()
             store.task_update(index, row)
         return {"ok": True}
