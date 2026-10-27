@@ -214,7 +214,7 @@ def save_local(directory, record):
     temporary.replace(directory / "record.json")
 
 
-def archive(record, directory, cloud):
+def archive(record, directory, cloud, write_index=True):
     cloud.check()
     existing = cloud.find_record(record["record_id"])
     if existing:
@@ -233,11 +233,12 @@ def archive(record, directory, cloud):
     record["cloud_saved"] = True
     answer = record_answer(record)
     link = "https://drive.google.com/file/d/" + record["drive_file_id"] + "/view"
-    try:
-        cloud.log(record, record["message"], answer, record["entry"], record["user_id"], record.get("event_id", ""))
-        record["index_saved"] = True
-    except Exception:
-        record["index_saved"] = False
+    if write_index:
+        try:
+            cloud.log(record, record["message"], answer, record["entry"], record["user_id"], record.get("event_id", ""))
+            record["index_saved"] = True
+        except Exception:
+            record["index_saved"] = False
     record["drive_url"] = link
     record.pop("archive_error", None)
     return record
@@ -266,6 +267,17 @@ def _ingest(source, user_id, message="", entry="Codex", event_id="", data=None, 
     record = json.loads(existing_path.read_text(encoding="utf-8")) if existing_path.exists() else {"record_id": key, "created_at": now(), "owner_id": owner, "source_url": identity, "resource_type": "url" if is_url else "file"}
     record.update(user_id=user_id, message=message or source, entry=entry, event_id=event_id, updated_at=now())
     save_local(directory, record)
+    cloud = cloud or Cloud()
+    # Preserve the source in the cloud before extraction or paid analysis. The local
+    # outbox is a recovery cache if authorization/network access is unavailable.
+    if not record.get("analysis"):
+        try:
+            record = archive(record, directory, cloud, write_index=False)
+            record["source_cloud_saved"] = True
+        except Exception as error:
+            record["source_cloud_saved"] = False
+            record["archive_error"] = safe_error(error)
+        save_local(directory, record)
     if not record.get("analysis"):
         try:
             if is_url and video_site(source):
@@ -295,6 +307,13 @@ def _ingest(source, user_id, message="", entry="Codex", event_id="", data=None, 
                     asset_name = "source.bin"
                 (directory / asset_name).write_bytes(data)
                 record.update(filename=filename, mime_type=mime_type, local_asset=asset_name, content_sha256=hashlib.sha256(data).hexdigest())
+                save_local(directory, record)
+                try:
+                    record = archive(record, directory, cloud, write_index=False)
+                    record["source_cloud_saved"] = True
+                except Exception as error:
+                    record["source_cloud_saved"] = False
+                    record["archive_error"] = safe_error(error)
                 save_local(directory, record)
                 content, partial = model_input(filename, data, mime_type)
             temporary_remote_file = content.pop("_temporary_gemini_file", None)
@@ -331,7 +350,15 @@ def _ingest(source, user_id, message="", entry="Codex", event_id="", data=None, 
     return {"record_id": key, "status": record["status"], "cloud_saved": record["cloud_saved"], "index_saved": record.get("index_saved", False), "local_record": str(directory / "record.json"), "answer": answer}
 
 
-def retrieve(user_id, query, limit=3):
+def retrieve(user_id, query, limit=3, skip_local=False):
+    if not skip_local:
+        try:
+            from knowledge_access import retrieve_local_context
+            local = retrieve_local_context(user_id, query)
+            if local.get("text"):
+                return local["text"]
+        except Exception:
+            pass  # Offline computers must not prevent cloud retrieval.
     owner = os.getenv("VIDEO_KNOWLEDGE_OWNER_ID", "").strip() or user_id
     terms = set(re.findall(r"[a-z0-9_]{2,}|[\u3400-\u9fff]", query.lower()))
     matches = []
@@ -349,6 +376,13 @@ def retrieve(user_id, query, limit=3):
     matches.sort(key=lambda pair: pair[0], reverse=True)
     if matches:
         return "\n\n".join(record_answer(dict(r, status="已完成")) + "\n來源：" + r["source_url"] + ("\n雲端主檔：" + r["drive_url"] if r.get("cloud_saved") else "\n保存狀態：僅本機暫存") for _, r in matches[:limit])[:12000]
+    try:
+        from knowledge_access import retrieve_cloud_project_context
+        shared = retrieve_cloud_project_context(user_id, query)
+        if shared:
+            return shared
+    except Exception:
+        pass
     return retrieve_cloud(user_id, query, limit)
 
 
@@ -404,3 +438,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

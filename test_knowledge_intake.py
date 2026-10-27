@@ -172,6 +172,19 @@ class IntakeTests(unittest.TestCase):
         self.assertTrue(partial)
         self.assertIn("僅部分內容", content["text"])
 
+    def test_original_is_cloud_saved_before_analysis_and_pending_seed_does_not_log(self):
+        cloud = ArchiveCloud()
+        def analyze(*args, **kwargs):
+            self.assertEqual(cloud.uploads[0][1], b"Knowledge")
+            self.assertTrue(cloud.record.get("asset_file_id"))
+            self.assertFalse(cloud.record.get("analysis"))
+            self.assertEqual(cloud.logged, [])
+            return dict(ANALYSIS)
+        with patch.object(intake, "_analyze", side_effect=analyze):
+            result = intake.ingest("notes.txt", "owner", data=b"Knowledge", filename="notes.txt", cloud=cloud)
+        self.assertTrue(result["cloud_saved"])
+        self.assertEqual(len(cloud.uploads), 1)
+
     @patch.object(intake, "upload_gemini_video", return_value={"type": "video", "uri": "https://example.com/uploaded", "_temporary_gemini_file": "files/test-file"})
     def test_large_platform_video_uses_file_reference_instead_of_inline_base64(self, upload):
         content, partial = intake.model_input("video.mp4", b"v" * (intake.MAX_BYTES + 1), "video/mp4")
@@ -207,3 +220,4 @@ class IntakeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

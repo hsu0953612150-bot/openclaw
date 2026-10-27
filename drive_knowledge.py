@@ -17,7 +17,6 @@ import fitz
 import openpyxl
 from docx import Document
 from pptx import Presentation
-from oauth2client.service_account import ServiceAccountCredentials
 
 
 DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
@@ -40,6 +39,7 @@ def _service_account_info():
 
 
 def _access_token():
+    from oauth2client.service_account import ServiceAccountCredentials
     credentials = ServiceAccountCredentials.from_json_keyfile_dict(
         _service_account_info(), [DRIVE_READ_SCOPE]
     )
@@ -294,3 +294,5 @@ def retrieve_knowledge(query):
             pass
         break
     return context, pdfs
+
+
