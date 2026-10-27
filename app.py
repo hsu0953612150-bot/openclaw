@@ -114,6 +114,7 @@ def health():
     return {
         "ok": configured,
         "service": "daga-line-gemini",
+        "render_git_commit": os.getenv("RENDER_GIT_COMMIT", "unknown"),
         "model": GEMINI_MODEL,
         "knowledge_intake": "links-files-v2",
         "codex_bridge": "owner-paired-sheets-v1",
