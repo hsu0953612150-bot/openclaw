@@ -345,6 +345,10 @@ def _ingest(source, user_id, message="", entry="Codex", event_id="", data=None, 
         answer += "\n\n大G主檔：" + record["drive_url"]
         if not record.get("index_saved"):
             answer += "\nSheets索引尚未寫入，可重傳補寫。"
+    elif record.get("source_cloud_saved"):
+        answer += "\n\n來源已保存在大G雲端；最新分析尚未同步，已暫存待重試。"
+        if record.get("drive_url"):
+            answer += "\n來源主檔：" + record["drive_url"]
     else:
         answer += "\n\n已本機暫存；尚未寫入大G雲端知識庫。\n" + record.get("archive_error", "")
     return {"record_id": key, "status": record["status"], "cloud_saved": record["cloud_saved"], "index_saved": record.get("index_saved", False), "local_record": str(directory / "record.json"), "answer": answer}

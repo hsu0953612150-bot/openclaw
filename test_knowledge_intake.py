@@ -5,7 +5,7 @@ from pathlib import Path
 import socket
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import zipfile
 
 import knowledge_intake as intake
@@ -184,6 +184,15 @@ class IntakeTests(unittest.TestCase):
             result = intake.ingest("notes.txt", "owner", data=b"Knowledge", filename="notes.txt", cloud=cloud)
         self.assertTrue(result["cloud_saved"])
         self.assertEqual(len(cloud.uploads), 1)
+
+    @patch.object(intake, "_analyze", return_value=dict(ANALYSIS))
+    def test_final_sync_failure_distinguishes_saved_source_from_pending_analysis(self, _):
+        cloud = ArchiveCloud()
+        cloud.check = Mock(side_effect=[{}, {}, RuntimeError("network unavailable")])
+        result = intake.ingest("notes.txt", "owner", data=b"Knowledge", filename="notes.txt", cloud=cloud)
+        self.assertFalse(result["cloud_saved"])
+        self.assertIn("來源已保存在大G雲端", result["answer"])
+        self.assertIn("最新分析尚未同步", result["answer"])
 
     @patch.object(intake, "upload_gemini_video", return_value={"type": "video", "uri": "https://example.com/uploaded", "_temporary_gemini_file": "files/test-file"})
     def test_large_platform_video_uses_file_reference_instead_of_inline_base64(self, upload):
