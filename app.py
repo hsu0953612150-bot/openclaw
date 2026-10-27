@@ -782,7 +782,7 @@ def process_message(
                 save_user_context(user_id, history, user_profile)
             except Exception:
                 app.logger.exception("Knowledge reply history save failed")
-            send_text(user_id, answer)
+            send_voice_reply(user_id, answer)
             return
         knowledge_text = ""
         knowledge_pdfs = []

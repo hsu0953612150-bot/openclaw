@@ -1,4 +1,7 @@
 import time
+import ast
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
@@ -8,6 +11,17 @@ from test_codex_line_bridge import MemoryStore
 
 
 class RoutingTests(unittest.TestCase):
+    def test_link_and_file_knowledge_final_replies_also_have_playback(self):
+        source = ast.parse((Path(__file__).parent / "app.py").read_text(encoding="utf-8"))
+        node = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "process_message")
+        for args in ({"user_text": "https://example.com"}, {"file_data": b"file", "filename": "test.txt"}):
+            voice, plain = Mock(), Mock()
+            namespace = {"load_user_context": lambda _: ([], {}), "update_profile_from_text": lambda p, _: p, "append_liveboard_memory": Mock(), "extract_urls": lambda _: ["https://example.com"] if "user_text" in args else [], "ingest_resource": Mock(return_value={"answer": "內容已分析及保存"}), "save_user_context": Mock(), "send_voice_reply": voice, "send_text": plain, "app": SimpleNamespace(logger=Mock())}
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "knowledge_final_reply", "exec"), namespace)
+            namespace["process_message"]("owner", **args)
+            voice.assert_called_once_with("owner", "內容已分析及保存")
+            plain.assert_not_called()
+
     def test_questions_greetings_links_and_cloud_knowledge_do_not_use_pc(self):
         for text in ("在嗎？", "有聽得到我說話嗎？", "Chrome是什麼？", "如何打開Chrome", "今天台北天氣如何", "幫我查台北到香港機票", "https://youtube.com/shorts/example", "分析這個影片並存入大G知識庫", "不要打開Chrome，只告訴我怎麼做", "幫我解釋電腦記憶體"):
             with self.subTest(text=text):
