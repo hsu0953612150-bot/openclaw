@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
+<title>大G・語音播放</title>
+<style>body{font-family:system-ui,sans-serif;background:#f5f7f6;color:#16362b;max-width:42rem;margin:3rem auto;padding:1.3rem}button{font:inherit;border:0;border-radius:12px;padding:1rem 1.6rem;background:#16754a;color:white;margin:0 .6rem .7rem 0}#reply{white-space:pre-wrap;line-height:1.8;background:white;padding:1.4rem;border-radius:14px}#status{min-height:2rem}</style>
+<h1>大G・語音播放</h1>
+<button id="play">▶ 播放語音</button><button id="stop">停止</button>
+<p id="status" role="status">點播放即可朗讀這則回覆。請勿轉傳此私人播放連結。</p>
+<div id="reply">{{ reply }}</div>
+<script>
+const text=document.getElementById('reply').textContent, status=document.getElementById('status');
+let stopped=false, parts=[], current=0, generation=0;
+function next(session){if(session!==generation)return;if(stopped||current>=parts.length){status.textContent=stopped?'已停止':'播放完畢';return;}
+ const u=new SpeechSynthesisUtterance(parts[current++]);u.lang='zh-TW';
+ const voices=speechSynthesis.getVoices();u.voice=voices.find(v=>v.lang==='zh-TW')||voices.find(v=>v.lang.startsWith('zh'))||null;
+ u.onend=()=>next(session);u.onerror=()=>{if(session===generation)status.textContent='目前瀏覽器無法朗讀，請使用右上選單以 Safari 或 Chrome 開啟。';};speechSynthesis.speak(u);}
+document.getElementById('play').onclick=()=>{if(!('speechSynthesis' in window)){status.textContent='請使用右上選單以 Safari 或 Chrome 開啟播放。';return;}
+ generation++;speechSynthesis.cancel();stopped=false;current=0;parts=text.match(/[\s\S]{1,160}/g)||[];status.textContent='正在播放';next(generation);};
+document.getElementById('stop').onclick=()=>{generation++;stopped=true;if('speechSynthesis' in window)speechSynthesis.cancel();status.textContent='已停止';};
+window.addEventListener('pagehide',()=>{generation++;stopped=true;if('speechSynthesis' in window)speechSynthesis.cancel();});
+</script></html>

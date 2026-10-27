@@ -41,8 +41,10 @@ from openai_fallback import (
 )
 
 
-from codex_line_bridge import deliver_notification, route_text as route_codex_text, verify_notification
+from codex_line_bridge import deliver_notification, line_api, route_text as route_codex_text, verify_notification
 from line_voice_bridge import route_audio_to_codex
+from message_routing import route_classified_text
+from reply_playback import PlaybackStore, final_messages
 
 
 app = Flask(__name__)
@@ -76,6 +78,7 @@ SYSTEM_INSTRUCTION = """你是 LINE 官方帳號「大G」的 AI 助理，使用
 _sheet_lock = threading.Lock()
 _audio_lock = threading.Lock()
 _audio_cache = {}
+_tts_retry_after = 0
 _live_token_lock = threading.Lock()
 _live_token_requests = []
 _startup_greeting_lock = threading.Lock()
@@ -114,6 +117,8 @@ def health():
         "knowledge_intake": "links-files-v2",
         "codex_bridge": "owner-paired-sheets-v1",
         "codex_voice_bridge": "transcribe-to-codex-v1",
+        "message_routing": "computer-intent-v2",
+        "reply_playback": "per-answer-v1",
         "knowledge_cloud_configured": bool(os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN") and os.getenv("GOOGLE_DRIVE_FOLDER_ID")),
     }, (200 if configured else 503)
 
@@ -123,11 +128,26 @@ def live_voice_page():
     return render_template("live_voice.html")
 
 
+@app.get("/listen/<token>")
+def reply_playback_page(token):
+    try:
+        reply = PlaybackStore().load(token)
+        response = app.make_response(render_template("reply_playback.html", reply=reply))
+    except LookupError:
+        response = app.make_response(("播放連結不存在或已到期，請回LINE要求重新提供這則回覆。", 410))
+    except Exception:
+        app.logger.error("Reply playback storage unavailable")
+        response = app.make_response(("播放暫時無法讀取，請稍後再試。", 503))
+    response.headers.update({"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex, nofollow", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"})
+    return response
+
+
+
 @app.post("/api/codex/deliver")
 def deliver_codex_result():
     try:
         payload = verify_notification(os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN", ""), request.get_data(), request.headers.get("X-Daga-Codex-Signature", ""))
-        return deliver_notification(payload, os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")), 200
+        return deliver_notification(payload, os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""), reply_messages=build_final_reply_messages), 200
     except PermissionError:
         return {"error": "通知驗證失敗或尚未綁定"}, 403
     except (ValueError, TypeError):
@@ -681,34 +701,36 @@ def synthesize_reply_audio(text):
     return converted, duration_ms
 
 
-def send_voice_reply(user_id, text):
-    audio_mp3, duration_ms = synthesize_reply_audio(text)
+def build_reply_audio_message(text):
+    global _tts_retry_after
+    if time.time() < _tts_retry_after:
+        raise RuntimeError("Speech synthesis temporarily unavailable; use playback button")
+    try:
+        audio_mp3, duration_ms = synthesize_reply_audio(text)
+    except Exception:
+        _tts_retry_after = time.time() + 300
+        app.logger.warning("Speech synthesis failed; keeping per-answer playback button")
+        raise
     token = secrets.token_urlsafe(24)
     expires_at = time.time() + AUDIO_URL_TTL_SECONDS
     with _audio_lock:
         _audio_cache[token] = (audio_mp3, expires_at, duration_ms)
     audio_url = f"{PUBLIC_BASE_URL}/audio/{token}.mp3"
-    payload = json.dumps({
-        "to": user_id,
-        "messages": [
-            {"type": "text", "text": text},
-            {"type": "audio", "originalContentUrl": audio_url, "duration": duration_ms},
-        ],
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        "https://api.line.me/v2/bot/message/push",
-        data=payload,
-        headers={"Authorization": f"Bearer {os.getenv('LINE_CHANNEL_ACCESS_TOKEN')}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            if response.status >= 300:
-                raise RuntimeError(f"LINE audio reply returned HTTP {response.status}")
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"LINE audio reply returned HTTP {error.code}: {detail}") from error
-    app.logger.info("LINE text and voice reply sent successfully")
+    return {"type": "audio", "originalContentUrl": audio_url, "duration": duration_ms}
+
+
+
+def build_final_reply_messages(text):
+    return final_messages(text, PUBLIC_BASE_URL, audio_message=build_reply_audio_message)
+
+
+
+def send_voice_reply(user_id, text):
+    messages = build_final_reply_messages(text)
+    delivery = "reply:" + secrets.token_hex(16)
+    for index in range(0, len(messages), 5):
+        line_api("message/push", os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""), {"to": user_id, "messages": messages[index:index+5]}, delivery + ":" + str(index // 5))
+    app.logger.info("LINE final reply with playback button sent successfully")
 
 
 def process_message(
@@ -900,14 +922,7 @@ def process_message(
             save_user_context(user_id, history, user_profile)
         except Exception:
             app.logger.exception("Google Sheets context write failed; AI reply will still be sent")
-        if audio_b64:
-            try:
-                send_voice_reply(user_id, answer)
-            except Exception:
-                app.logger.exception("Voice reply failed; sending the text reply instead")
-                send_text(user_id, answer)
-        else:
-            send_text(user_id, answer)
+        send_voice_reply(user_id, answer)
         app.logger.info("LINE final reply sent successfully")
     except Exception as error:
         app.logger.exception("LINE/Gemini message processing failed")
@@ -944,7 +959,7 @@ def handle_text(event):
 
 def process_text_route(user_id, user_text, _image=None, line_message_id="", source_type="user"):
     try:
-        response = route_codex_text(user_id, user_text, line_message_id, source_type)
+        response = route_classified_text(user_id, user_text, line_message_id, source_type)
         if response is not None:
             send_text(user_id, response)
             return
@@ -1007,10 +1022,11 @@ def process_audio_message(user_id, message_id, source_type="user", duration_ms=0
             with ApiClient(configuration) as api_client:
                 return bytes(MessagingApiBlob(api_client).get_message_content(message_id))
 
-        routed = route_audio_to_codex(user_id, message_id, load_audio, source_type, duration_ms)
+        routed = route_audio_to_codex(user_id, message_id, load_audio, source_type, duration_ms, normal_chat=lambda text: process_message(user_id, text, line_message_id="audio:" + message_id))
         if routed is not None:
-            send_text(user_id, routed)
-            app.logger.info("Paired owner LINE audio routed to the local Codex queue")
+            if routed:
+                send_text(user_id, routed)
+            app.logger.info("Paired owner LINE audio classified and handled")
             return
         audio_content = load_audio()
         audio_b64 = base64.b64encode(audio_content).decode("ascii")
@@ -1047,4 +1063,5 @@ if __name__ == "__main__":
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 1000)))
+
 

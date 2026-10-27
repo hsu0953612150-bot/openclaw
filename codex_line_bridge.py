@@ -52,7 +52,7 @@ def line_api(path, token, body=None, delivery_id=""):
         raise
 
 
-def deliver_notification(data, token, store=None):
+def deliver_notification(data, token, store=None, audio_message=None, reply_messages=None):
     """Signed notifications deliver only a stored owner's result, never caller text."""
     store = store or BridgeStore()
     config = store.control()
@@ -79,7 +79,18 @@ def deliver_notification(data, token, store=None):
             instruction = f"回答 {row[0]} 你的答案" if row[7] == "question" else f"確認 {row[0]}」或「拒絕 {row[0]}"
             text = f"Codex需要你的{'回答' if row[7] == 'question' else '確認'}：\n{row[3]}\n\n請回覆「{instruction}」。30分鐘內未回答就不授權。"
         chunks = [text[i:i + 4000] for i in range(0, min(len(text), 20000), 4000)] or ["已完成，沒有文字輸出。"]
-        line_api("message/push", token, {"to": owner, "messages": [{"type": "text", "text": part} for part in chunks]}, data["kind"] + ":" + data["id"])
+        messages = [{"type": "text", "text": part} for part in chunks]
+        if reply_messages:
+            messages = reply_messages(text)
+        elif data["kind"] == "result" and audio_message:
+            try:
+                messages.append(audio_message(row[6]))
+            except Exception:
+                # Preserve the result if speech generation is unavailable.
+                pass
+        for offset in range(0, len(messages), 5):
+            delivery_id = data["kind"] + ":" + data["id"] + (":" + str(offset // 5) if offset else "")
+            line_api("message/push", token, {"to": owner, "messages": messages[offset:offset+5]}, delivery_id)
         if data["kind"] == "result":
             row[9] = timestamp()
             store.task_update(index, row)
@@ -166,7 +177,7 @@ def route_text(user_id, text, message_id, source_type="user", store=None):
                 return "綁定碼不正確。"
             store.set_control("owner_id", user_id)
             store.set_control("pairing_sha256", "")
-            return "已綁定這台電腦。你接下來傳的所有文字會交給本機 Codex；回覆會送回這個 LINE 對話。可傳「電腦狀態」查看連線。"
+            return "已綁定這台電腦。一般問答由大G回覆，需要操作電腦的要求才交給本機Codex；結果會送回這個LINE對話。可傳「電腦狀態」查看連線。"
         if not owner or user_id != owner:
             return None
         if text.strip() in ("電腦狀態", "电脑状态"):
