@@ -134,8 +134,10 @@ class BridgeStore:
         try:
             return {row[0]: row[1] if len(row) > 1 else "" for row in self.read(CONTROL, "A2:B11") if row}
         except Exception as error:
-            # An unprovisioned bridge leaves the original LINE assistant available.
-            if getattr(error, "code", None) == 400:
+            # Only a missing control tab means the bridge has not been provisioned.
+            # OAuth refresh failures also return HTTP 400; treating those as an empty
+            # config silently routes computer requests to the general assistant.
+            if _is_missing_control_tab(error):
                 return {}
             raise
 
@@ -154,6 +156,22 @@ class BridgeStore:
 
     def question_update(self, index, row):
         self.write(QUESTIONS, f"A{index}:H{index}", [row[:8]])
+
+
+
+def _is_missing_control_tab(error):
+    if getattr(error, "code", None) != 400:
+        return False
+    url = getattr(error, "url", "") or ""
+    if not url.startswith("https://sheets.googleapis.com/"):
+        return False
+    try:
+        payload = json.loads(error.read().decode("utf-8", "replace"))
+    except (AttributeError, OSError, ValueError):
+        return False
+    detail = payload.get("error", {})
+    message = detail.get("message", "") if isinstance(detail, dict) else ""
+    return "Unable to parse range" in message and CONTROL in message
 
 
 def route_text(user_id, text, message_id, source_type="user", store=None):

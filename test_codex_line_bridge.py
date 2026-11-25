@@ -1,7 +1,9 @@
 import hashlib
+import io
 import json
 import time
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import codex_line_bridge as bridge
@@ -36,6 +38,30 @@ class MemoryStore:
 
 
 class LineBridgeTests(unittest.TestCase):
+    def test_control_does_not_treat_google_oauth_400_as_unprovisioned(self):
+        error = HTTPError("https://oauth2.googleapis.com/token", 400, "Bad Request", {}, io.BytesIO(b'{"error":"invalid_grant"}'))
+
+        class BrokenCloud:
+            sheet_id = "sheet-id"
+
+            def api(self, *_args, **_kwargs):
+                raise error
+
+        with self.assertRaises(HTTPError):
+            bridge.BridgeStore(cloud=BrokenCloud()).control()
+
+    def test_control_treats_only_missing_control_tab_as_unprovisioned(self):
+        body = json.dumps({"error": {"message": "Unable to parse range: 'Codex連線'!A2:B11"}}).encode()
+        error = HTTPError("https://sheets.googleapis.com/v4/spreadsheets/sheet-id/values/range", 400, "Bad Request", {}, io.BytesIO(body))
+
+        class MissingControlTabCloud:
+            sheet_id = "sheet-id"
+
+            def api(self, *_args, **_kwargs):
+                raise error
+
+        self.assertEqual(bridge.BridgeStore(cloud=MissingControlTabCloud()).control(), {})
+
     def test_notification_requires_signature_and_recent_timestamp(self):
         body = json.dumps({"kind": "probe", "timestamp": time.time()}).encode()
         signature = bridge.notification_signature("example-secret", body)
