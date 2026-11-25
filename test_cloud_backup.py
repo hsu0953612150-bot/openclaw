@@ -78,6 +78,30 @@ class BackupTests(unittest.TestCase):
         self.assertEqual((self.root / "files/doc/storage-policy.txt").read_bytes(), old)
         self.assertEqual(backup.read_json(self.root / "manifest.json", {})["files"]["doc"]["version"], "1")
 
+    def test_readonly_backup_succeeds_without_any_cloud_upload(self):
+        result = backup.sync_once(self.cloud, self.root, self.cloud.fetch, publish_index=False)
+        self.assertTrue(result["complete"])
+        self.assertEqual(self.cloud.uploads, [])
+        self.assertIn("storage-policy", backup.search_local("storage policy", self.root)["text"])
+
+    def test_classification_tags_and_original_source_get_verified_local_catalog(self):
+        analysis = {"title": "AI assistant workflow", "category": "AI與自動化", "tags": ["語音", "自動化"], "summary": "existing source analysis"}
+        record = {"record_id": "knowledge", "source_url": "https://example.com/source", "analysis": analysis}
+        self.cloud.data = json.dumps(record, ensure_ascii=False).encode()
+        original_api = self.cloud.api
+        def api(url, *args, **kwargs):
+            result = original_api(url, *args, **kwargs)
+            if "drive/v3/files?" in url:
+                result["files"][0].update(name="knowledge.json", mimeType="application/json")
+            return result
+        self.cloud.api = api
+        self.sync()
+        catalog = backup.read_json(self.root / "knowledge-catalog.json", {})["records"]
+        self.assertEqual(catalog[0]["analysis"], analysis)
+        self.assertEqual(catalog[0]["tags"], analysis["tags"])
+        self.assertTrue(Path(catalog[0]["local_record"]).is_file())
+        self.assertEqual(catalog[0]["record_sha256"], backup.digest(Path(catalog[0]["local_record"])))
+
     def test_deleted_cloud_file_is_retained_but_no_longer_searchable(self):
         self.sync()
         with patch.object(backup, "drive_files", return_value=[]):

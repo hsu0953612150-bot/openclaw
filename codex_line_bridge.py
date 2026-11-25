@@ -105,7 +105,9 @@ def timestamp():
 
 class BridgeStore:
     def __init__(self, cloud=None):
-        self.cloud = cloud or Cloud()
+        # Queue uses already granted Sheets access independently of personal Drive.
+        self.cloud = cloud or Cloud(auth_mode="service_account", scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        self.drive_cloud = cloud or Cloud(auth_mode="service_account", scopes=["https://www.googleapis.com/auth/drive.readonly"])
         self.base = "https://sheets.googleapis.com/v4/spreadsheets/" + self.cloud.sheet_id
 
     def read(self, tab, cells="A:J"):
@@ -233,3 +235,5 @@ def route_text(user_id, text, message_id, source_type="user", store=None):
         store.append(TASKS, [job_id, timestamp(), owner, message_id, text, "queued", "", "", timestamp(), ""])
         online = time.time() - float(config.get("worker_heartbeat") or 0) < 150
         return ("已交給電腦 Codex 排隊處理" if online else "電腦目前離線，已保留任務，連線後處理") + "。任務編號：" + job_id
+
+

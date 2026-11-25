@@ -109,7 +109,7 @@ def retrieve_cloud_project_context(user_id, query, store=None):
     owner = store.control().get("owner_id", "")
     if not owner or user_id not in (owner, "codex-local"):
         return ""
-    cloud = store.cloud
+    cloud = getattr(store, "drive_cloud", store.cloud)
     if not re.fullmatch(r"[A-Za-z0-9_-]+", cloud.folder_id or ""):
         return ""
     files = cloud.list_files("'" + cloud.folder_id + "' in parents and trashed=false and appProperties has { key='daga_role' and value='lookup-index' }", limit=1)

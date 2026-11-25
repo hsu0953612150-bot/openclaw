@@ -91,7 +91,11 @@ def extract_video_urls(text):
 
 
 class Cloud:
-    def __init__(self):
+    def __init__(self, auth_mode="auto", scopes=None):
+        if auth_mode not in ("auto", "service_account"):
+            raise ValueError("Unsupported Google authorization mode")
+        self.auth_mode = auth_mode
+        self.scopes = scopes or ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"]
         raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON") or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
         if not raw and os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE"):
             raw = Path(os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"]).read_text(encoding="utf-8-sig")
@@ -106,7 +110,7 @@ class Cloud:
     def token(self):
         if self._expires > time.time() + 60:
             return self._token
-        refresh = os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN", "")
+        refresh = os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN", "") if self.auth_mode == "auto" else ""
         if refresh:
             body = urllib.parse.urlencode({"client_id": os.environ["GOOGLE_OAUTH_CLIENT_ID"], "client_secret": os.environ["GOOGLE_OAUTH_CLIENT_SECRET"], "refresh_token": refresh, "grant_type": "refresh_token"}).encode()
             request = urllib.request.Request("https://oauth2.googleapis.com/token", data=body)
@@ -124,7 +128,7 @@ class Cloud:
             return base64.urlsafe_b64encode(value).rstrip(b"=")
 
         issued = int(time.time())
-        claims = {"iss": self.credentials["client_email"], "scope": "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/spreadsheets", "aud": "https://oauth2.googleapis.com/token", "iat": issued, "exp": issued + 3600}
+        claims = {"iss": self.credentials["client_email"], "scope": " ".join(self.scopes), "aud": "https://oauth2.googleapis.com/token", "iat": issued, "exp": issued + 3600}
         signing = encode(b'{"alg":"RS256","typ":"JWT"}') + b"." + encode(json.dumps(claims).encode())
         key = serialization.load_pem_private_key(self.credentials["private_key"].encode(), password=None)
         assertion = signing + b"." + encode(key.sign(signing, padding.PKCS1v15(), hashes.SHA256()))

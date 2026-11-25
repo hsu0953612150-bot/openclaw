@@ -128,10 +128,14 @@ def snapshot_sheets(cloud):
     return {"captured_at": stamp(), "spreadsheet_id": cloud.sheet_id, "title": meta.get("properties", {}).get("title", ""), "tabs": {title: rows.get("values", []) for title, rows in zip(titles, data.get("valueRanges", []))}}
 
 
-def sync_once(cloud=None, root=None, fetch_file=None):
+def sync_once(cloud=None, root=None, fetch_file=None, publish_index=None):
     root = Path(root or BACKUP)
     root.mkdir(parents=True, exist_ok=True)
-    cloud = cloud or Cloud()
+    if publish_index is None:
+        publish_index = cloud is not None
+    # Backup needs only already granted read access. Creating/updating cloud
+    # material remains a separate, explicitly selected user-owned operation.
+    cloud = cloud or Cloud(auth_mode="service_account", scopes=["https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/spreadsheets.readonly"])
     fetch_file = fetch_file or download
     with _backup_lock:
         previous = read_json(root / "manifest.json", {"files": {}})
@@ -186,6 +190,10 @@ def sync_once(cloud=None, root=None, fetch_file=None):
         write_json(root / "manifest.json", current)
         index = build_index(root)
         try:
+            if not publish_index:
+                current["cloud_index_publish"] = "not_requested_readonly_backup"
+                write_json(root / "manifest.json", current)
+                return {k: current[k] for k in ("complete", "downloaded", "unchanged", "bytes_downloaded", "errors", "finished_at")}
             documents = sorted(index["documents"], key=lambda item: item["id"])
             serialized = json.dumps({"documents": documents}, ensure_ascii=False, sort_keys=True).encode()
             index_hash = hashlib.sha256(serialized).hexdigest()
@@ -204,6 +212,7 @@ def build_index(root):
     from drive_knowledge import _extract_text, _split_text
     manifest = read_json(root / "manifest.json", {})
     documents = []
+    catalog = []
     for key, item in manifest.get("files", {}).items():
         try:
             if key not in manifest.get("active_ids", manifest.get("files", {})):
@@ -215,17 +224,30 @@ def build_index(root):
                 continue
             if digest(path) != item.get("sha256"):
                 continue  # Do not publish an altered local copy back into cloud search.
-            text = _extract_text(path.name, item.get("mimeType", ""), path.read_bytes())
+            raw = path.read_bytes()
+            title = item.get("name", path.name)
+            if path.suffix.lower() == ".json":
+                try:
+                    record = json.loads(raw)
+                    analysis = record.get("analysis", {}) if isinstance(record, dict) else {}
+                    if isinstance(analysis, dict) and analysis.get("title"):
+                        title = str(analysis["title"])
+                        asset = manifest.get("files", {}).get(record.get("asset_file_id"), {})
+                        catalog.append({"record_id": record.get("record_id", key), "title": title, "category": analysis.get("category", "其他"), "tags": analysis.get("tags", []), "source_url": record.get("source_url", ""), "analysis": analysis, "local_record": str(path), "record_sha256": item["sha256"], "local_asset": str(contained(root, asset["path"])) if asset.get("path") else None, "source_retention": record.get("source_retention", ""), "verified_at": stamp()})
+                except (ValueError, TypeError):
+                    pass
+            text = _extract_text(path.name, item.get("mimeType", ""), raw)
             for name, value in os.environ.items():
                 if any(part in name for part in ("TOKEN", "SECRET", "API_KEY", "ACCOUNT_JSON")) and len(value) >= 12:
                     text = text.replace(value, "[憑證已遮蔽]")
             text = re.sub(r"-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA )?PRIVATE KEY-----|\bsk-[A-Za-z0-9_-]{16,}", "[憑證已遮蔽]", text)
             if text.strip():
-                documents.append({"id": key, "name": item.get("name", path.name), "path": item["path"], "source_url": "https://drive.google.com/file/d/" + key + "/view", "chunks": _split_text(text[:50000]), "modified_time": item.get("modifiedTime", "")})
+                documents.append({"id": key, "name": title, "path": item["path"], "source_url": "https://drive.google.com/file/d/" + key + "/view", "chunks": _split_text(text[:50000]), "modified_time": item.get("modifiedTime", "")})
         except Exception:
             continue
     index = {"built_at": stamp(), "cloud_sync_at": manifest.get("finished_at"), "documents": documents}
     write_json(root / "index.json", index)
+    write_json(root / "knowledge-catalog.json", {"built_at": stamp(), "cloud_sync_at": manifest.get("finished_at"), "records": catalog})
     return index
 
 
