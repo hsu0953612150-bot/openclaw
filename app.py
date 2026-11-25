@@ -151,7 +151,7 @@ def reply_playback_page(token):
 @app.post("/api/codex/deliver")
 def deliver_codex_result():
     try:
-        payload = verify_notification(os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN", ""), request.get_data(), request.headers.get("X-Daga-Codex-Signature", ""))
+        payload = verify_notification(os.getenv("CODEX_NOTIFICATION_SECRET") or os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN", ""), request.get_data(), request.headers.get("X-Daga-Codex-Signature", ""))
         return deliver_notification(payload, os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""), reply_messages=build_final_reply_messages), 200
     except PermissionError:
         return {"error": "通知驗證失敗或尚未綁定"}, 403
