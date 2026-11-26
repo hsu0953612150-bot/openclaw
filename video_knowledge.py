@@ -206,9 +206,17 @@ class Cloud:
             self.api(values_url + "?valueInputOption=RAW", {"values": [HEADERS]}, "PUT")
         elif rows[0] != HEADERS:
             raise RuntimeError("影片連結紀錄分頁欄位不符，未覆寫既有資料")
-        if event_id and any(len(r) > 9 and r[8:10] == [record["record_id"], event_id] for r in rows[1:]):
-            return
         row = [now(), user_id, entry, record["source_url"], message[:12000], answer[:12000], "https://drive.google.com/file/d/" + record["drive_file_id"] + "/view", record["status"], record["record_id"], event_id]
+        if event_id:
+            for index, existing in enumerate(rows[1:], start=2):
+                if len(existing) > 9 and existing[8:10] == [record["record_id"], event_id]:
+                    # A retry can finish an earlier pending intake. Update its
+                    # exact index row instead of retaining the stale outcome.
+                    row[0] = existing[0]
+                    if existing != row:
+                        target = urllib.parse.quote("'" + self.tab.replace("'", "''") + f"'!A{index}:J{index}", safe="")
+                        self.api(base + "/values/" + target + "?valueInputOption=RAW", {"values": [row]}, "PUT")
+                    return
         self.api(values_url + ":append?valueInputOption=RAW&insertDataOption=INSERT_ROWS", {"values": [row]})
 
 
