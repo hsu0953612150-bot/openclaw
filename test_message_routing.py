@@ -43,6 +43,28 @@ class RoutingTests(unittest.TestCase):
             self.assertIsNone(route_classified_text(user, "打開Chrome", "id", source, store))
             self.assertEqual(store.rows, [])
 
+    def test_private_seller_work_routes_without_computer_keyword(self):
+        requests = (
+            "帮我确认一下我那个虾皮这一个礼拜的流量跟进度，然后整理一个简单的报表发给我",
+            "幫我看蝦皮這週流量及訪客數",
+            "請查詢 Shopee 的訂單與銷售",
+            "請把 A16 商品圖片上傳蝦皮",
+        )
+        for text in requests:
+            with self.subTest(text=text):
+                store = MemoryStore()
+                self.assertIsNotNone(route_classified_text("owner", text, "id", store=store))
+                self.assertEqual(len(store.rows), 1)
+        for user, source in (("other", "user"), ("owner", "group")):
+            store = MemoryStore()
+            self.assertIsNone(route_classified_text(user, requests[0], "id", source, store))
+            self.assertEqual(store.rows, [])
+
+    def test_seller_advice_and_public_product_comparison_stay_chat(self):
+        for text in ("蝦皮流量是什麼？", "請問蝦皮如何查看流量？", "教我如何在蝦皮上架", "幫我比較蝦皮和淘寶的手機價格", "幫我解釋蝦皮轉換率"):
+            with self.subTest(text=text):
+                self.assertFalse(needs_computer(text))
+
     def test_followups_need_active_task_but_new_question_stays_cloud(self):
         store = MemoryStore()
         self.assertIsNone(route_classified_text("owner", "請繼續", "id", store=store))
@@ -70,3 +92,4 @@ class RoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

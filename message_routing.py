@@ -17,6 +17,14 @@ def needs_computer(text, active=False):
         return False
     if re.search(r"(?:不要|不用|別|别|無需|无需).{0,6}(?:操作|使用|打開|打开|開啟|开启).{0,12}(?:電腦|电脑|Chrome|Edge|瀏覽器|浏览器|YouTube)", text, re.I):
         return False
+    # A request for private seller data requires the owner's signed-in desktop,
+    # even when the message does not literally mention a computer or browser.
+    seller_platform = re.search(r"蝦皮|虾皮|shopee|賣家中心|卖家中心|我的(?:賣場|卖场|店鋪|店铺)", text, re.I)
+    seller_work = re.search(r"流量|訪客|访客|瀏覽量|浏览量|轉換率|转换率|銷售|销售|訂單|订单|營收|营收|業績|业绩|上架|商品圖片|商品图片|賣場進度|卖场进度", text)
+    requested_action = re.search(r"幫我|帮我|替我|請|请|查看|查詢|查询|檢查|检查|確認|确认|整理|匯出|导出|上傳|上传|上架|更新", text)
+    advice_only = re.search(r"(?:如何|怎麼|怎么).{0,20}(?:流量|數據|数据|訂單|订单|上架|圖片|图片|查看|查詢|查询)|解釋|解释|介紹|介绍", text)
+    if seller_platform and seller_work and requested_action and not advice_only:
+        return True
     if re.search(r"(?:交給|交给|請用|请用|透過|通过|使用).{0,8}(?:Codex|電腦|电脑).{0,15}(?:處理|处理|執行|执行|操作)|^(?:Codex|電腦|电脑)\s*[:：]", text, re.I):
         return True
     action = r"打開|打开|開啟|开启|關閉|关闭|啟動|启动|操作|登入|登录|點擊|点击|安裝|安装|卸載|卸载|截圖|截图|刪除|删除|移動|移动|重新命名|修改|修正|建立|創建|创建|讀取|读取|檢查|检查|儲存|储存|保存|寫入|写入|整理|清理|搜尋|搜索|找出"
@@ -49,3 +57,4 @@ def route_classified_text(user_id, text, message_id, source_type="user", store=N
     if needs_computer(text, active):
         return route_text(user_id, text, message_id, source_type, store)
     return None
+
